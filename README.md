@@ -82,12 +82,15 @@ adb shell am force-stop com.miui.home
   （`~/.android/debug.keystore`，缺失时自动生成；可用 `DEBUG_STORE_FILE`
   等变量切换为自定义 keystore）。**本地构建版与官方版签名不同，不能互相
   覆盖安装**，换装需卸载重装；debug 构建不得当作官方版分发。
-- **本地 release 构建**（维护者自用）：复制
+- **本地 release 构建**（维护者自用）：密码优先从 macOS Keychain 读取
+  （`security add-generic-password -U -a "$USER" -s "MixUnfold-release" -w`，
+  仓库不保存任何明文密码文件），也可导出环境变量
+  `RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS /
+  RELEASE_KEY_PASSWORD`，或复制
   [signing.properties.example](signing.properties.example) 为仓库根目录
-  的 `signing.properties` 并填入真实值（已被 .gitignore 排除，**禁止提交**），
-  或导出环境变量 `RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD /
-  RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD`；配置缺失或字段为空时
-  `./build.sh --release` 会失败并提示，不会用 debug 签名冒充发布版。
+  的 `signing.properties` 填入真实值（已被 .gitignore 排除，**禁止提交**）。
+  配置缺失或字段为空时 `./build.sh --release` 会失败并提示，不会用 debug
+  签名冒充发布版。
 
 ### 覆盖安装（升级）条件
 

@@ -13,4 +13,5 @@ signing.properties
 keystore.properties
 *.jks
 *.keystore
+*.pass
 local.properties

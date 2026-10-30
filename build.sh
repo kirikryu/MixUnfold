@@ -7,11 +7,14 @@
 #   ./build.sh --release  # release 构建：私有 keystore 签名（官方发布用）
 #
 # release 签名配置来源（优先级从高到低）：
-#   1. 环境变量 RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD /
+#   1. macOS Keychain：service=MixUnfold-release，account=$USER
+#      （security add-generic-password -U -a "$USER" -s "MixUnfold-release" -w）
+#   2. 环境变量 RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD /
 #      RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD（CI 用，密钥不落盘）
-#   2. 仓库根目录 signing.properties（参考 signing.properties.example，
+#   3. 仓库根目录 signing.properties（参考 signing.properties.example，
 #      已被 .gitignore 排除，禁止提交）
 # 配置缺失时 release 构建失败并给出提示；debug 构建不受影响。
+# 密码经 apksigner 的 env: 通道传入，不出现在命令行参数（ps 不可见）。
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$PWD"
@@ -22,7 +25,7 @@ for arg in "$@"; do
         --release) MODE=release ;;
         --debug)   MODE=debug ;;
         -h|--help)
-            sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "unknown option: $arg (see $0 --help)" >&2; exit 2 ;;
     esac
@@ -35,6 +38,9 @@ AJ="${AJ:-/opt/homebrew/share/android-commandlinetools/platforms/android-35/andr
 OUT="${OUT:-releases/MixUnfold.apk}"
 API=27
 
+KEYCHAIN_SERVICE="${KEYCHAIN_SERVICE:-MixUnfold-release}"
+KEYCHAIN_ACCOUNT="${KEYCHAIN_ACCOUNT:-$USER}"
+
 trim() {
     local s="$1"
     s="${s#"${s%%[![:space:]]*}"}"
@@ -45,6 +51,12 @@ trim() {
 # --- signing -----------------------------------------------------------------
 
 KS="" KS_ALIAS="" KS_PASS="" KEY_PASS=""
+
+read_keychain_password() {
+    command -v security >/dev/null 2>&1 || return 0
+    security find-generic-password -a "$KEYCHAIN_ACCOUNT" \
+        -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true
+}
 
 setup_debug_signing() {
     # 标准 debug 签名：~/.android/debug.keystore（与 Android Studio/Gradle
@@ -71,7 +83,7 @@ setup_debug_signing() {
 
 setup_release_signing() {
     local prop="$ROOT/signing.properties"
-    local sf="" sp="" ka="" kp=""
+    local sf="" sp="" ka="" kp="" src=""
     if [ -f "$prop" ]; then
         local line key val
         while IFS= read -r line || [ -n "$line" ]; do
@@ -87,38 +99,59 @@ setup_release_signing() {
             esac
         done < "$prop"
     fi
-    # 环境变量优先于 signing.properties
+
+    # storeFile/keyAlias 不是机密（keystore 文件本身不入库，别名公开写在
+    # CI workflow 中），提供仓库约定默认值；密码仍必须来自 Keychain/env/文件。
     KS="${RELEASE_STORE_FILE:-$sf}"
-    KS_PASS="${RELEASE_STORE_PASSWORD:-$sp}"
+    [ -z "$KS" ] && KS="keystore/release.jks"
     KS_ALIAS="${RELEASE_KEY_ALIAS:-$ka}"
-    KEY_PASS="${RELEASE_KEY_PASSWORD:-$kp}"
-    KEY_PASS="${KEY_PASS:-$KS_PASS}"
+    [ -z "$KS_ALIAS" ] && KS_ALIAS="mixunfold"
+
+    # store 密码优先级：Keychain > 环境变量 > signing.properties
+    KS_PASS="$(read_keychain_password)"
+    if [ -n "$KS_PASS" ]; then
+        src="keychain($KEYCHAIN_SERVICE)"
+    else
+        KS_PASS="${RELEASE_STORE_PASSWORD:-}"
+        if [ -n "$KS_PASS" ]; then
+            src="environment"
+        elif [ -n "$sp" ]; then
+            KS_PASS="$sp"
+            src="signing.properties"
+        fi
+    fi
+
+    KEY_PASS="${RELEASE_KEY_PASSWORD:-}"
+    [ -z "$KEY_PASS" ] && KEY_PASS="$kp"
+    [ -z "$KEY_PASS" ] && KEY_PASS="$KS_PASS"
 
     if [ -z "$KS" ] || [ -z "$KS_PASS" ] || [ -z "$KS_ALIAS" ]; then
         cat >&2 <<'EOF'
 error: release 构建需要签名配置，但未找到或字段为空。
-需要以下任一来源（环境变量优先）：
-  1. 环境变量 RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS
+按优先级检查以下任一来源：
+  1. macOS Keychain：
+       security add-generic-password -U -a "$USER" -s "MixUnfold-release" -w
+  2. 环境变量 RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS
      （可选 RELEASE_KEY_PASSWORD，缺省与 store 密码相同）
-  2. 仓库根目录 signing.properties（复制 signing.properties.example 填写，
+  3. 仓库根目录 signing.properties（复制 signing.properties.example 填写，
      该文件已被 .gitignore 排除，禁止提交）
-请配置 signing.properties 或使用 debug 构建：./build.sh
+请配置签名或使用 debug 构建：./build.sh
 EOF
         exit 1
     fi
     case "$KS" in
         /*) ;;
- *)  KS="$ROOT/$KS" ;;
+        *)  KS="$ROOT/$KS" ;;
     esac
     if [ ! -f "$KS" ]; then
         echo "error: keystore 文件不存在: $KS（检查 storeFile / RELEASE_STORE_FILE）" >&2
         exit 1
     fi
+    echo "[0/6] release signing: $KS_ALIAS <- $(basename "$KS")（来源: ${src}）"
 }
 
 if [ "$MODE" = release ]; then
     setup_release_signing
-    echo "[0/6] release signing: $KS_ALIAS <- $(basename "$KS")"
 else
     [ -f "$ROOT/signing.properties" ] && \
         echo "note: debug 构建；忽略 signing.properties（release 构建用 --release）"
@@ -153,11 +186,12 @@ echo "[4/6] zipalign"
 "$BT/zipalign" -f -p 4 build/base.apk build/aligned.apk
 
 echo "[5/6] apksigner ($MODE)"
-mkdir -p "$(dirname "$OUT")"
+export MIXUNFOLD_KS_PASS="$KS_PASS" MIXUNFOLD_KEY_PASS="$KEY_PASS"
 "$BT/apksigner" sign \
     --ks "$KS" --ks-key-alias "$KS_ALIAS" \
-    --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
+    --ks-pass "env:MIXUNFOLD_KS_PASS" --key-pass "env:MIXUNFOLD_KEY_PASS" \
     --out "$OUT" build/aligned.apk
+unset MIXUNFOLD_KS_PASS MIXUNFOLD_KEY_PASS
 
 echo "[6/6] verify"
 "$BT/apksigner" verify --print-certs "$OUT"
