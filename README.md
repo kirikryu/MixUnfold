@@ -7,7 +7,7 @@
 跨页列距与页内列距完全一致。**不修改任何系统文件**——桌面保持小米
 平台签名，全部系统权限无损。
 
-适配：MIX FOLD 1 · MIUI 桌面 4.39.12.x · Android 11 · LSPosed
+适配：MIX FOLD 1（cetus）· 系统桌面 4.39.12.x · HyperOS 1.0（Android 13）· LSPosed
 
 ## 功能
 
@@ -158,7 +158,9 @@ grep -v '^#' SHA256SUMS.txt | sha256sum -c -   # macOS: … | shasum -a 256 -c
 运行时改变三个输入：
 
 1. **方向开关**：`DeviceConfig.updateRotate` 原本硬编码排除 cetus，
-   钩子重算 `sRotatable = isInFoldDeviceLargeScreen(context)`
+   钩子按桌面当前所在屏实时重算折叠状态（内屏解锁旋转、外屏保持原版
+   竖屏锁定），并在折叠切换后重发方向请求——原版此路径为空，展开态的
+   "跟随旋转"请求会残留到外屏上
 2. **网格几何**：列数（`DeviceConfig.getCellCountX`，实时）与工作宽
    （`setWorkspaceCellPadding` → `sWorkspaceCellPaddingSide = B/2`）按
    当前激活的 DeviceProfile 读取；`列宽 = (页宽 − B) / 列数`
@@ -172,7 +174,8 @@ grep -v '^#' SHA256SUMS.txt | sha256sum -c -   # macOS: … | shasum -a 256 -c
 
 ## 已知边界
 
-- 折叠态外屏由系统锁定竖屏，属物理/策略限制
+- 折叠态外屏桌面保持竖屏锁定——这是原版桌面的策略而非系统限制（外屏上
+  其它应用的旋转不受影响），本模块按"外屏正常、内屏自动旋转"显式维持该行为
 - 桌面编辑模式的缩略图视图未针对多列网格做适配
 - 页数少于 5 页时选三页模式，末组可能不满——预期行为，无法修改（三页模式不强制补页）
 - MIUI 大版本更新可能改变目标类的结构，钩子点需重新核对

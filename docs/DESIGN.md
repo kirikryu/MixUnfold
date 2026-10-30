@@ -1,7 +1,8 @@
 # 设计文档
 
-目标设备：Xiaomi MIX FOLD 1（代号 `cetus`），MIUI 系统桌面 `com.miui.home`
-4.39.12.x（Android 11）。文中行号/字段以该版本反编译结果为准。
+目标设备：Xiaomi MIX FOLD 1（代号 `cetus`），HyperOS 1.0（Android 13），
+系统桌面 `com.miui.home` 4.39.12.x（`RELEASE-4.39.12.6887`）。文中行号/
+字段以该版本反编译结果为准，关键钩子点已经设备实机 dexdump 复核。
 
 ## 1. 为什么运行时挂钩是唯一可行路线
 
@@ -42,7 +43,8 @@
 
 | # | 目标 | 方式 | 效果 |
 |---|---|---|---|
-| 1 | `DeviceConfig.updateRotate` | after | `sRotatable = isInFoldDeviceLargeScreen(ctx)`，去除 cetus 排除 |
+| 1 | `DeviceConfig.updateRotate` | after | `sRotatable = isInFoldDeviceLargeScreen(ctx)`，去除 cetus 排除；上下文优先取**实时桌面 Activity**（见 1b） |
+| 1b | `DeviceConfig.isRotatable` | before | 消费点实时重判折叠态：按桌面当前所在屏的 `smallestScreenWidthDp`（内屏 ≈654dp、外屏 ≈393dp，阈值 600），MIUI 自家 `isInFoldDeviceLargeScreen(实时上下文)` 作后备 |
 | 2 | `LauncherCellCountCompatDevice.shouldUseDeviceValue` | replace→true | 绕过密度/主题门槛，保证设备值生效 |
 | 3 | 基类 `getCellCountXDef/Max/Min` + Fold/Cetus 子类 `…FromDevice` | replace→统一列数 | 桌面列数（设置键 `cetus_home_columns`） |
 | 4 | `DeviceConfig.setWorkspaceCellPadding` | after | 展开态 `sWorkspaceCellPaddingSide = B/2`（B 为外侧边距，竖/横独立键） |
@@ -51,7 +53,8 @@
 | 8 | `DeviceConfig.calcGridSize` | after | 三页模式下工作宽跟随 `屏宽/3`，并触发 `calculateCellSize` 重算 |
 | 9 | `DeviceConfig.getCellCountX` | before→实时列数 | 原生列数进程启动后缓存且旋转不重读；设置值进程内缓存一次，热路径零额外查询 |
 | 10 | `Application.onCreate` | after | 注册进程内重启广播接收器 |
-| 11/12 | `Launcher.onResume` / `Workspace.reorderScreens` | after | 偶数页策略：页数不足翻页单位时末尾补空白页（编辑模式跳过） |
+| 11/12 | `Launcher.onResume` / `Workspace.reorderScreens` | after | 偶数页策略：页数不足翻页单位时末尾补空白页（编辑模式跳过）；onResume 顺带触发 13b 的方向重发（去重，无开销） |
+| 13b | `Launcher.onConfigurationChanged` | after | 折叠/展开切换后重跑方向请求决策（复刻 `RotationHelper.notifyChange` 并按 `mLastActivityFlags` 去重） |
 
 另有 `Application.onCreate` after 中注册的进程内广播接收器
 （`cetushome.rotationunlock.RESTART`），供控制面板触发桌面重启。
@@ -121,3 +124,35 @@ if (Application.getLauncher() != this) {
 重新拉起——用户侧表现为"桌面崩溃重载"。触发条件是系统级内存压力，
 与本模块无关（崩溃缓冲区无记录、模块接收器未触发、调用栈纯原生）。
 伴随特征：整机 swap 高占用、load 飙升、某前台应用失控占用 CPU。
+
+## 8. 外屏误旋转的根因与修正（v1.6.3）
+
+预期是"外屏正常（锁定竖屏）、展开内屏跟随系统旋转"，实测展开后再折叠，
+外屏桌面也能转到横屏。逆向结论（4.39.12）：
+
+1. **方向请求的唯一出口**：`RotationHelper.notifyChange()`——
+   `isRotatable()==true` 时 `setRequestedOrientation(UNSPECIFIED)`
+   （跟随传感器/系统自动旋转），false 时按状态机请求锁定（空闲 →
+   `PORTRAIT`）。请求**只在 notifyChange 里发出**，且其公开的重入点
+   （`setCurrentStateRequest/setCurrentTransitionRequest`）都对"状态
+   未变"去重。
+2. **折叠切换不触发重判**：`Launcher` 声明了全部 `configChanges`
+   （旋转/折叠均不重建 Activity），而 `RotationHelper.onConfigurationChanged`
+   是一个**空方法**——折叠后没有任何路径重新调用 notifyChange，
+   展开态发出的 `UNSPECIFIED` 请求原样残留在外屏上。
+3. **静态值本身也过期**：`updateRotate` 只在
+   `Application.onConfigurationChanged/onDisplayFoldChanged` 等少数时点
+   调用，且实参是**应用上下文**；`isInFoldDeviceLargeScreen` 走
+   `Configuration.getScreenType()` 反射路径，应用上下文的配置不随折叠
+   可靠更新，折叠后仍判"大屏"→ `sRotatable=true`。
+
+修正（钩子 1b + 13b）：
+
+- **消费点实时重判**（1b）：`isRotatable()` before 钩子按桌面 Activity
+  实时所在的屏重新推导（`smallestScreenWidthDp ≥ 600`，MIUI 自家
+  判定作后备），所有消费方读到的都是当前真实状态，不再依赖任何缓存。
+- **折叠后重发请求**（13b）：`Launcher.onConfigurationChanged` after
+  钩子复刻 notifyChange 的决策并按 `mLastActivityFlags` 去重重发——
+  展开态不变（`UNSPECIFIED`，去重为零开销），折叠后立即回落到
+  `PORTRAIT` 锁定，与原版外屏行为一致。`Launcher.onResume` 顺带走
+  同一去重路径作保险。
