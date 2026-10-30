@@ -1,0 +1,13 @@
+# 提交前拦截密钥材料：gitleaks 扫描暂存区，命中即阻止提交。
+# 依赖安装：
+#   brew install gitleaks pre-commit
+#   pre-commit install
+repos:
+  - repo: local
+    hooks:
+      - id: gitleaks-staged
+        name: gitleaks (staged changes)
+        entry: gitleaks protect --staged --redact
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
