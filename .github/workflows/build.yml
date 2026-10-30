@@ -27,26 +27,43 @@ jobs:
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
           "$SDKM" "build-tools;34.0.0" "platforms;android-35" >/dev/null
 
-      - name: Restore release signing key
+      # tag 构建必须产出官方签名的发布版：缺 Secrets 直接失败，
+      # 绝不允许回退 debug 签名冒充官方发布。
+      - name: Decode release keystore from Secrets
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASS: ${{ secrets.RELEASE_KEYSTORE_PASS }}
         run: |
-          if [ -n "$RELEASE_KEYSTORE" ]; then
-            mkdir -p keystore
-            echo "$RELEASE_KEYSTORE" | base64 -d > keystore/release.jks
+          if [ -z "$RELEASE_KEYSTORE" ] || [ -z "$RELEASE_KEYSTORE_PASS" ]; then
+            echo "::error::tag 构建需要仓库 Secrets：RELEASE_KEYSTORE_BASE64 与 RELEASE_KEYSTORE_PASS（缺一则无法产出官方签名发布版）"
+            exit 1
           fi
+          SIGN_DIR="$RUNNER_TEMP/signing"
+          mkdir -p "$SIGN_DIR"
+          printf '%s' "$RELEASE_KEYSTORE" | base64 -d > "$SIGN_DIR/release.jks"
+          # 只把 keystore 路径写入 GITHUB_ENV；密码经 Build 步骤的 env
+          # 直接从 Secrets 注入进程，不落盘、不进日志。
+          echo "RELEASE_STORE_FILE=$SIGN_DIR/release.jks" >> "$GITHUB_ENV"
+          echo "RELEASE_KEY_ALIAS=mixunfold" >> "$GITHUB_ENV"
 
       - name: Build APK
         env:
-          RELEASE_KEYSTORE_PASS: ${{ secrets.RELEASE_KEYSTORE_PASS }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASS }}
         run: |
           export JDK_BIN="$JAVA_HOME/bin"
           export BT="$ANDROID_HOME/build-tools/34.0.0"
           export AJ="$ANDROID_HOME/platforms/android-35/android.jar"
-          if [ -f keystore/release.jks ] && [ -n "$RELEASE_KEYSTORE_PASS" ]; then
-            export KS=keystore/release.jks KS_ALIAS=mixunfold KS_PASS="$RELEASE_KEYSTORE_PASS"
+          if [ -n "${RELEASE_STORE_FILE:-}" ]; then
+            ./build.sh --release
+          else
+            ./build.sh   # 分支/手动触发：标准 debug 签名的本地构建
           fi
-          ./build.sh
+
+      - name: Remove signing material
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/signing"
 
       - name: Create release with APK
         if: startsWith(github.ref, 'refs/tags/v')
@@ -57,3 +74,18 @@ jobs:
               --title "MixUnfold ${GITHUB_REF_NAME#v}" \
               --generate-notes \
           || gh release upload "$GITHUB_REF_NAME" releases/MixUnfold.apk --clobber
+
+      - name: Append checksums to release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          APK=releases/MixUnfold.apk
+          APK_SHA="$(sha256sum "$APK" | cut -d' ' -f1)"
+          CERT_SHA="$("$BT/apksigner" verify --print-certs "$APK" \
+              | grep 'SHA-256 digest' | head -1 | awk '{print $NF}')"
+          BODY="$(gh release view "$GITHUB_REF_NAME" --json body -q .body)"
+          printf '%s\n\n## 校验\n\n- APK 文件 SHA-256：`%s`\n- 证书 SHA-256：`%s`\n' \
+              "$BODY" "$APK_SHA" "$CERT_SHA" \
+              | gh release edit "$GITHUB_REF_NAME" --notes-file -

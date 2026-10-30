@@ -1,0 +1,18 @@
+# MixUnfold release 签名配置模板
+#
+# 用法：复制本文件为仓库根目录的 signing.properties 并填入真实值：
+#   cp signing.properties.example signing.properties
+# signing.properties 已被 .gitignore 排除，禁止提交到仓库；
+# storePassword / keyPassword 等机密也绝不能写入任何被提交的文件。
+#
+# 也可以不使用本文件，改为在环境中导出同名大写变量（CI 即采用此方式），
+# 环境变量优先于 signing.properties：
+#   RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS /
+#   RELEASE_KEY_PASSWORD
+#
+# storeFile 相对仓库根目录（build.sh 所在目录）解析，也可写绝对路径。
+# keyPassword 可省略（整行删除或留空），省略时使用 storePassword。
+storeFile=keystore/release.jks
+storePassword=CHANGE_ME
+keyAlias=CHANGE_ME
+keyPassword=CHANGE_ME

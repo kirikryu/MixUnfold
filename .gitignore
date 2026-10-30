@@ -1,8 +1,16 @@
 build/
 releases/
+release/
 keystore/
 .DS_Store
 *.iml
 .zcode/
 .v2c/
 .video_agent/
+
+# 签名与本地敏感配置（signing.properties.example 是提交的模板，勿忽略）
+signing.properties
+keystore.properties
+*.jks
+*.keystore
+local.properties

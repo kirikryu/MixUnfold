@@ -30,7 +30,8 @@
 ## 安装
 
 1. 设备已 root（Magisk / KernelSU）并安装 LSPosed
-2. `./build.sh` 生成 `releases/MixUnfold.apk`，或直接使用 Release 产物
+2. `./build.sh` 本地构建（debug 签名），或直接使用官方 Release 产物
+   （两者签名不同，不能互相覆盖安装，见下方[签名与校验](#签名与校验)）
 3. `adb install -r releases/MixUnfold.apk`
 4. LSPosed → 模块 → 启用 MixUnfold → 作用域勾选 **系统桌面**
 5. 重启桌面（模块内按钮或 `adb shell am force-stop com.miui.home`）
@@ -69,24 +70,68 @@ adb shell settings put system cetus_home_land_pages 3
 adb shell am force-stop com.miui.home
 ```
 
-## 签名与分发
+## 签名与校验
 
-请仅从 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)
-获取官方 APK。官方版由**私有**签名密钥签发——密钥只存在于维护者本地与 CI
-的 GitHub Secrets，仓库与任何克隆中都不包含它。
+### 官方版与本地构建版的差异
 
-- **证书指纹 = 官方身份凭证**：`apksigner verify --print-certs` 对比下方
-  指纹，可确认 APK 由官方密钥签发
-- **APK 文件 SHA-256 = 完整性校验**：`shasum -a 256 MixUnfold.apk` 与
-  Release 说明中的哈希比对。两者是两回事——证书指纹证"谁签的"，
-  文件哈希证"是不是这个文件"
-- 源码自行构建的产物为本地 debug 签名，与官方版**签名不同、不能互相覆盖
-  安装**，换装需卸载重装。仓库不提供面向用户的构建指引，build.sh 仅供
-  CI 与开发者使用
+- **官方发布版**（[GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)）
+  由维护者的**私有 release keystore** 签发。密钥只存在于维护者本地与 CI
+  的 GitHub Secrets，仓库及任何克隆中都不包含它；CI 在 `v*` tag 构建时把
+  keystore 从 Secrets 解码到临时目录签名，构建后删除。
+- **本地源码构建**：`./build.sh` 默认使用 Android 标准 debug 签名
+  （`~/.android/debug.keystore`，缺失时自动生成；可用 `DEBUG_STORE_FILE`
+  等变量切换为自定义 keystore）。**本地构建版与官方版签名不同，不能互相
+  覆盖安装**，换装需卸载重装；debug 构建不得当作官方版分发。
+- **本地 release 构建**（维护者自用）：复制
+  [signing.properties.example](signing.properties.example) 为仓库根目录
+  的 `signing.properties` 并填入真实值（已被 .gitignore 排除，**禁止提交**），
+  或导出环境变量 `RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD /
+  RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD`；配置缺失或字段为空时
+  `./build.sh --release` 会失败并提示，不会用 debug 签名冒充发布版。
+
+### 覆盖安装（升级）条件
+
+Android 允许覆盖安装（保留数据升级）须**同时**满足：
+
+1. 包名相同（`cetushome.rotationunlock`）
+2. 签名证书相同
+3. 新 APK 的 `versionCode` 不低于已安装版本
+4. 用户允许安装未知来源应用（adb 安装还需 USB 调试授权）
+
+第 2 条不满足时系统报“签名不一致”，必须先卸载旧版（数据丢失）。
+Play App Signing、系统平台签名等由商店/系统托管的场景规则另计——本模块
+面向已 root 设备的 adb 侧载分发，不经过 Play 渠道。
+
+### 校验命令
+
+```bash
+# 查看 APK 使用的签名证书
+apksigner verify --print-certs app-release.apk
+
+# APK 文件哈希
+sha256sum app-release.apk            # macOS: shasum -a 256 app-release.apk
+
+# 查看 keystore 中某张证书的信息与指纹
+keytool -list -v -keystore release.jks -alias <alias>
+```
+
+官方版证书指纹（同时随每个 Release 附在 Release 说明中）：
 
 ```text
 Signer #1 certificate SHA-256: 234743a1e6dce8365b66e382e7c478fee80757b9d90d22f34697d89c26f34967
 ```
+
+### 证书 SHA-256 ≠ APK 文件 SHA-256
+
+- **证书 SHA-256** 只能确认“这个 APK 用了哪张证书”。与上方指纹一致仅
+  说明签名密钥相同，**不能单独证明 APK 由官方构建**——同一张证书可以
+  签出内容任意的 APK。
+- **APK 文件 SHA-256** 才对应“这个确切的文件”，可用于发现传输损坏或
+  篡改；但其参考值必须来自**可信渠道**（官方 Release 说明、维护者另行
+  公布的渠道），与 APK 同处分发的哈希没有防篡改意义。
+
+请仅从官方 Releases 下载 APK，并对照 Release 说明中公布的 APK 文件
+SHA-256 核对。
 
 发版由 GitHub Actions 在 `v*` tag 推送时自动构建并发布
 （[.github/workflows/build.yml](.github/workflows/build.yml)）。
