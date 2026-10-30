@@ -1,8 +1,11 @@
 package cetushome.hook;
 
 import android.app.Activity;
+import android.content.res.ColorStateList;
+import android.content.res.Resources;
 import android.graphics.Color;
 import android.os.Bundle;
+import android.util.TypedValue;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
@@ -25,6 +28,11 @@ import android.widget.Toast;
  * outer margins are governed by the "外侧边距优化" constraint switch —
  * users never enter pixel values by hand. All values are written via root
  * and take effect after "重启系统桌面".
+ *
+ * UI text colors are never hardcoded: they resolve from the activity theme
+ * (textColorPrimary / textColorSecondary / colorAccent), then get a WCAG AA
+ * contrast check (>= 4.5:1) against the resolved window background, so the
+ * panel stays readable in both light and dark system themes.
  */
 public class MainActivity extends Activity {
 
@@ -37,11 +45,22 @@ public class MainActivity extends Activity {
     private int cols = 3, padPort = 120, padLand = 120, landPages = 3;
     private boolean padOpt = false;
 
+    /** Theme-resolved text colors, contrast-checked against the window bg. */
+    private int cPrimary, cSecondary, cAccent;
+
     private TextView colsVal, marginInfo, status;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        int bg = backgroundProxy();
+        cPrimary = ensureContrast(themeColor(android.R.attr.textColorPrimary,
+                0xFF1A1A1A), bg, 4.5);
+        cSecondary = ensureContrast(themeColor(android.R.attr.textColorSecondary,
+                0xFF616161), bg, 4.5);
+        cAccent = ensureContrast(themeColor(android.R.attr.colorAccent,
+                0xFF1976D2), bg, 4.5);
 
         cols = read(KEY_COLUMNS, 3);
         padPort = read(KEY_PAD_PORT, 120);
@@ -57,13 +76,13 @@ public class MainActivity extends Activity {
         TextView title = new TextView(this);
         title.setText("MixUnfold");
         title.setTextSize(24);
-        title.setTextColor(Color.WHITE);
+        title.setTextColor(cPrimary);
         root.addView(title);
 
         TextView sub = new TextView(this);
         sub.setText("MIX FOLD 1 桌面增强 · LSPosed 模块");
         sub.setTextSize(13);
-        sub.setTextColor(0xFF9FB4C7);
+        sub.setTextColor(cSecondary);
         root.addView(sub);
 
         root.addView(makeGap());
@@ -74,7 +93,7 @@ public class MainActivity extends Activity {
 
         TextView pagesName = new TextView(this);
         pagesName.setText("横屏页面组配置");
-        pagesName.setTextColor(Color.WHITE);
+        pagesName.setTextColor(cPrimary);
         pagesName.setTextSize(15);
         root.addView(pagesName);
 
@@ -96,7 +115,7 @@ public class MainActivity extends Activity {
 
         TextView pagesNote = new TextView(this);
         pagesNote.setTextSize(13);
-        pagesNote.setTextColor(0xFF9FB4C7);
+        pagesNote.setTextColor(cSecondary);
         pagesNote.setPadding(dp(8), dp(2), 0, 0);
         pagesNote.setText("桌面不足 5 页时选三页，末组可能不满——预期行为。");
         root.addView(pagesNote);
@@ -106,7 +125,7 @@ public class MainActivity extends Activity {
         final Switch optSwitch = new Switch(this);
         optSwitch.setText("屏幕外侧边距优化");
         optSwitch.setTextSize(15);
-        optSwitch.setTextColor(Color.WHITE);
+        optSwitch.setTextColor(cPrimary);
         optSwitch.setChecked(padOpt);
         optSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
@@ -118,7 +137,7 @@ public class MainActivity extends Activity {
 
         TextView optDesc = new TextView(this);
         optDesc.setTextSize(13);
-        optDesc.setTextColor(0xFF9FB4C7);
+        optDesc.setTextColor(cSecondary);
         optDesc.setPadding(dp(8), dp(2), 0, 0);
         optDesc.setText("开启：竖屏外侧边距固定 120px；横屏按页面组适配——两页 280px、三页 0px（三页铺满、页间无缝）。\n"
                 + "关闭：采用小米原版边距方案（原生边距与页缝保留）。");
@@ -126,7 +145,7 @@ public class MainActivity extends Activity {
 
         marginInfo = new TextView(this);
         marginInfo.setTextSize(14);
-        marginInfo.setTextColor(0xFF7EB8FF);
+        marginInfo.setTextColor(cAccent);
         marginInfo.setPadding(dp(8), dp(4), 0, 0);
         root.addView(marginInfo);
 
@@ -146,7 +165,7 @@ public class MainActivity extends Activity {
 
         status = new TextView(this);
         status.setTextSize(13);
-        status.setTextColor(0xFF9FB4C7);
+        status.setTextColor(cSecondary);
         status.setPadding(0, dp(16), 0, 0);
         status.setText("改完数值点“应用设置”，再点“重启系统桌面”生效。\n"
                 + "重启桌面后，建议横竖屏切换几次，让优化完全应用。\n"
@@ -183,6 +202,109 @@ public class MainActivity extends Activity {
 
     private int read(String key, int def) {
         return Settings.System.getInt(getContentResolver(), key, def);
+    }
+
+    // --- theme-adaptive text colors (no hardcoded palette) ----------------------
+
+    /** Resolve a theme color attribute to a concrete ARGB value, or {@code def}. */
+    private int themeColor(int attr, int def) {
+        TypedValue tv = new TypedValue();
+        if (!getTheme().resolveAttribute(attr, tv, true)) {
+            return def;
+        }
+        if (tv.type >= TypedValue.TYPE_FIRST_COLOR_INT
+                && tv.type <= TypedValue.TYPE_LAST_COLOR_INT) {
+            return tv.data;
+        }
+        if (tv.resourceId != 0) {
+            try {
+                // textColorPrimary/Secondary are usually color state lists;
+                // the default state is what plain text renders with.
+                ColorStateList csl =
+                        getResources().getColorStateList(tv.resourceId, getTheme());
+                return csl.getDefaultColor();
+            } catch (Resources.NotFoundException e) {
+                // attribute points at a drawable or other non-color resource
+            }
+        }
+        return def;
+    }
+
+    /**
+     * Best-effort window background color. When the theme paints the window
+     * with a drawable instead of a flat color, invert the primary-text
+     * lightness: the platform guarantees primary text contrasts with the
+     * background, so dark text implies a light window and vice versa.
+     */
+    private int backgroundProxy() {
+        int bg = themeColor(android.R.attr.windowBackground, 0);
+        if (bg != 0) {
+            return bg;
+        }
+        int primary = themeColor(android.R.attr.textColorPrimary, Color.BLACK);
+        return luminance(primary) > 0.5 ? Color.BLACK : Color.WHITE;
+    }
+
+    /** Composite fg over bg — theme secondary colors carry alpha. */
+    private static int flatten(int fg, int bg) {
+        int a = Color.alpha(fg);
+        if (a == 255) {
+            return fg;
+        }
+        int r = (Color.red(fg) * a + Color.red(bg) * (255 - a)) / 255;
+        int g = (Color.green(fg) * a + Color.green(bg) * (255 - a)) / 255;
+        int b = (Color.blue(fg) * a + Color.blue(bg) * (255 - a)) / 255;
+        return Color.rgb(r, g, b);
+    }
+
+    /** WCAG 2.x relative luminance. */
+    private static double luminance(int c) {
+        double r = Color.red(c) / 255.0;
+        double g = Color.green(c) / 255.0;
+        double b = Color.blue(c) / 255.0;
+        r = r <= 0.03928 ? r / 12.92 : Math.pow((r + 0.055) / 1.055, 2.4);
+        g = g <= 0.03928 ? g / 12.92 : Math.pow((g + 0.055) / 1.055, 2.4);
+        b = b <= 0.03928 ? b / 12.92 : Math.pow((b + 0.055) / 1.055, 2.4);
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+
+    /** WCAG contrast ratio between two ARGB colors (1.0 – 21.0). */
+    private static double contrastRatio(int a, int b) {
+        double la = luminance(a), lb = luminance(b);
+        return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+    }
+
+    /**
+     * Nudge a foreground color until it reaches {@code minRatio} against the
+     * background, keeping its hue. Lowering HSV value scales luminance down
+     * monotonically, so the light-background branch always converges; the
+     * dark branch raises value, then drains saturation toward white (blues
+     * at full value still cannot reach AA on black). Returns black/white if
+     * the hue is hopeless.
+     */
+    private static int ensureContrast(int fg, int bg, double minRatio) {
+        fg = flatten(fg, bg);
+        if (contrastRatio(fg, bg) >= minRatio) {
+            return fg;
+        }
+        float[] hsv = new float[3];
+        Color.colorToHSV(fg, hsv);
+        if (luminance(bg) >= luminance(fg)) {
+            while (hsv[2] > 0f && contrastRatio(fg, bg) < minRatio) {
+                hsv[2] = Math.max(0f, hsv[2] - 0.02f);
+                fg = Color.HSVToColor(hsv);
+            }
+            return contrastRatio(fg, bg) >= minRatio ? fg : Color.BLACK;
+        }
+        while (hsv[2] < 1f && contrastRatio(fg, bg) < minRatio) {
+            hsv[2] = Math.min(1f, hsv[2] + 0.02f);
+            fg = Color.HSVToColor(hsv);
+        }
+        while (hsv[1] > 0f && contrastRatio(fg, bg) < minRatio) {
+            hsv[1] = Math.max(0f, hsv[1] - 0.02f);
+            fg = Color.HSVToColor(hsv);
+        }
+        return contrastRatio(fg, bg) >= minRatio ? fg : Color.WHITE;
     }
 
     private void apply() {
@@ -282,12 +404,12 @@ public class MainActivity extends Activity {
 
     private TextView addSeekBar(LinearLayout root, String label, int value, int min, int max, OnChange cb) {
         TextView name = new TextView(this);
-        name.setTextColor(Color.WHITE);
+        name.setTextColor(cPrimary);
         name.setTextSize(15);
         root.addView(name);
 
         final TextView val = new TextView(this);
-        val.setTextColor(0xFF7EB8FF);
+        val.setTextColor(cAccent);
         val.setTextSize(14);
 
         SeekBar bar = new SeekBar(this);
