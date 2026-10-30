@@ -118,7 +118,7 @@ sha256sum app-release.apk            # macOS: shasum -a 256 app-release.apk
 keytool -list -v -keystore release.jks -alias <alias>
 ```
 
-官方版证书指纹（同时随每个 Release 附在 Release 说明中）：
+官方版证书指纹（随每个 Release 附于附件 `SHA256SUMS.txt`）：
 
 ```text
 Signer #1 certificate SHA-256: 234743a1e6dce8365b66e382e7c478fee80757b9d90d22f34697d89c26f34967
@@ -130,11 +130,16 @@ Signer #1 certificate SHA-256: 234743a1e6dce8365b66e382e7c478fee80757b9d90d22f34
   说明签名密钥相同，**不能单独证明 APK 由官方构建**——同一张证书可以
   签出内容任意的 APK。
 - **APK 文件 SHA-256** 才对应“这个确切的文件”，可用于发现传输损坏或
-  篡改；但其参考值必须来自**可信渠道**（官方 Release 说明、维护者另行
-  公布的渠道），与 APK 同处分发的哈希没有防篡改意义。
+  篡改；但其参考值必须来自**可信渠道**（官方 Release 附件
+  `SHA256SUMS.txt`、维护者另行公布的渠道），与 APK 同处分发的哈希没有
+  防篡改意义。
 
-请仅从官方 Releases 下载 APK，并对照 Release 说明中公布的 APK 文件
-SHA-256 核对。
+请仅从官方 Releases 下载 APK，并对照 Release 附件 `SHA256SUMS.txt`
+核对（附件中 `#` 注释行为官方证书 SHA-256，可与上方指纹对照）：
+
+```bash
+grep -v '^#' SHA256SUMS.txt | sha256sum -c -   # macOS: … | shasum -a 256 -c
+```
 
 发版由 GitHub Actions 在 `v*` tag 推送时自动构建并发布
 （[.github/workflows/build.yml](.github/workflows/build.yml)）。

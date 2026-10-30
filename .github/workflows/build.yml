@@ -123,14 +123,21 @@ jobs:
           BT="$ANDROID_HOME/build-tools/34.0.0"
           APK=releases/MixUnfold.apk
           "$BT/apksigner" verify --print-certs "$APK"
+          # 校验值只写入附件 SHA256SUMS.txt，不进 Release 正文
           APK_SHA="$(sha256sum "$APK" | cut -d' ' -f1)"
           CERT_SHA="$("$BT/apksigner" verify --print-certs "$APK" \
               | grep 'SHA-256 digest' | head -1 | awk '{print $NF}')"
+          printf '%s  %s\n# certificate SHA-256 (apksigner): %s\n' \
+              "$APK_SHA" "$(basename "$APK")" "$CERT_SHA" > SHA256SUMS.txt
           gh release create "$GITHUB_REF_NAME" "$APK" \
               --title "MixUnfold ${GITHUB_REF_NAME#v}" \
               --generate-notes \
           || gh release upload "$GITHUB_REF_NAME" "$APK" --clobber
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS.txt --clobber
+          # 正文只留一行校验指针；重跑时已有则不重复追加
           BODY="$(gh release view "$GITHUB_REF_NAME" --json body -q .body)"
-          printf '%s\n\n## 校验\n\n- APK 文件 SHA-256：`%s`\n- 证书 SHA-256：`%s`\n' \
-              "$BODY" "$APK_SHA" "$CERT_SHA" \
-              | gh release edit "$GITHUB_REF_NAME" --notes-file -
+          case "$BODY" in
+            *SHA256SUMS.txt*) ;;
+            *) printf '%s\n\n完整性校验：见附件 `SHA256SUMS.txt`；校验方法见 README「签名与校验」。\n' \
+                "$BODY" | gh release edit "$GITHUB_REF_NAME" --notes-file - ;;
+          esac
