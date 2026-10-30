@@ -41,9 +41,11 @@ public class MainActivity extends Activity {
     private static final String KEY_PAD_LAND = MainHook.KEY_PAD_LAND;
     private static final String KEY_LAND_PAGES = MainHook.KEY_LAND_PAGES;
     private static final String KEY_PAD_OPT = MainHook.KEY_PAD_OPT;
+    private static final String KEY_LOCK_ROT = MainHook.KEY_LOCK_ROT;
 
     private int cols = 3, padPort = 120, padLand = 120, landPages = 3;
     private boolean padOpt = false;
+    private boolean lockRot = true;
 
     /** Theme-resolved text colors, contrast-checked against the window bg. */
     private int cPrimary, cSecondary, cAccent;
@@ -67,6 +69,7 @@ public class MainActivity extends Activity {
         padLand = read(KEY_PAD_LAND, 120);
         landPages = read(KEY_LAND_PAGES, 3);
         padOpt = read(KEY_PAD_OPT, 0) == 1;
+        lockRot = read(KEY_LOCK_ROT, 1) == 1;
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -148,6 +151,31 @@ public class MainActivity extends Activity {
         marginInfo.setTextColor(cAccent);
         marginInfo.setPadding(dp(8), dp(4), 0, 0);
         root.addView(marginInfo);
+
+        root.addView(makeGap());
+
+        final Switch lockSwitch = new Switch(this);
+        lockSwitch.setText("锁屏允许横屏");
+        lockSwitch.setTextSize(15);
+        lockSwitch.setTextColor(cPrimary);
+        lockSwitch.setChecked(lockRot);
+        lockSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
+                lockRot = checked;
+            }
+        });
+        root.addView(lockSwitch);
+
+        TextView lockDesc = new TextView(this);
+        lockDesc.setTextSize(13);
+        lockDesc.setTextColor(cSecondary);
+        lockDesc.setPadding(dp(8), dp(2), 0, 0);
+        lockDesc.setText("开启：内屏展开态的锁屏跟随系统自动旋转。\n"
+                + "小米未适配 cetus 横屏锁屏，横屏锁屏可能出现布局异常，\n"
+                + "出问题时关闭此开关即可恢复原版（重启系统界面生效：\n"
+                + "adb shell pkill -f com.android.systemui，或重启手机）。\n"
+                + "折叠态外屏锁屏始终为竖屏，不受此开关影响。");
+        root.addView(lockDesc);
 
         root.addView(makeGap());
 
@@ -315,7 +343,8 @@ public class MainActivity extends Activity {
                 + " && settings put system " + KEY_PAD_OPT + " " + (padOpt ? 1 : 0)
                 + " && settings put system " + KEY_PAD_PORT + " " + port
                 + " && settings put system " + KEY_PAD_LAND + " " + land
-                + " && settings put system " + KEY_LAND_PAGES + " " + landPages;
+                + " && settings put system " + KEY_LAND_PAGES + " " + landPages
+                + " && settings put system " + KEY_LOCK_ROT + " " + (lockRot ? 1 : 0);
         new Thread(new Runnable() {
             @Override public void run() {
                 boolean ok = false;
@@ -339,7 +368,8 @@ public class MainActivity extends Activity {
                             Toast.makeText(MainActivity.this, "已保存，重启桌面后生效",
                                     Toast.LENGTH_SHORT).show();
                             status.setText("已保存：桌面 " + cols + " 列；横屏 " + landPages
-                                    + " 页；边距竖 " + port + "px / 横 " + land + "px。");
+                                    + " 页；边距竖 " + port + "px / 横 " + land + "px；锁屏横屏 "
+                                    + (lockRot ? "开" : "关") + "。");
                         } else {
                             status.setText("写入失败（root 未授权？）" + (errF == null ? "" : "：" + errF));
                         }

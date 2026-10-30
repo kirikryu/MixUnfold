@@ -2,7 +2,7 @@
 
 一个面向小米 MIX FOLD 1（代号 `cetus`）系统桌面的 LSPosed 模块。
 
-解锁折叠内屏桌面的横竖旋转；桌面网格列数全形态统一，横竖屏外侧边距
+解锁折叠内屏桌面与展开态锁屏的横竖旋转；桌面网格列数全形态统一，横竖屏外侧边距
 按形态自动取固定值（竖 120 / 横 280 或 0），不可手调；两页反向对齐，
 跨页列距与页内列距完全一致。**不修改任何系统文件**——桌面保持小米
 平台签名，全部系统权限无损。
@@ -13,6 +13,8 @@
 
 - **旋转解锁**：移除 `DeviceConfig.updateRotate` 对 cetus 的硬编码排除，
   展开内屏后桌面跟随系统旋转
+- **锁屏旋转解锁**：内屏展开态的锁屏跟随系统自动旋转（SystemUI 进程钩子，
+  总开关"锁屏允许横屏"）；折叠态外屏锁屏保持原版竖屏，不受影响
 - **统一网格 + 自动边距**：桌面列数横竖屏统一（默认 3 列），避免同一份
   图标数据库在两种列数间切换导致的小组件遮挡；横竖屏外侧边距按形态
   自动取固定值，不可手调
@@ -38,7 +40,7 @@
    `JDK_BIN` / `BT` / `AJ` 环境变量覆盖），或直接使用官方 Release 产物
    （两者签名不同，不能互相覆盖安装，见下方[签名与校验](#签名与校验)）
 3. `adb install -r releases/MixUnfold.apk`
-4. LSPosed → 模块 → 启用 MixUnfold → 作用域勾选 **系统桌面**
+4. LSPosed → 模块 → 启用 MixUnfold → 作用域勾选 **系统桌面** 与 **系统界面**
 5. 重启桌面（模块内按钮或 `adb shell am force-stop com.miui.home`）
 
 > 注意：通过 adb 更新模块 APK 后，LSPosed 偶发不会向新启动的桌面进程
@@ -54,6 +56,7 @@
 | 桌面列数 | 3 | 滑杆，横竖屏统一（2–6） |
 | 横屏同屏页数 | 3 | 下拉选择：2 页 / 3 页；=3 时列数跟随桌面列数 |
 | 屏幕外侧边距优化 | 关 | 开启后进入约束方案（见下），边距不可手输 |
+| 锁屏允许横屏 | 开 | 内屏展开态锁屏跟随系统自动旋转；关闭即恢复原版（重启系统界面生效） |
 
 **外侧边距约束方案**（勾选“屏幕外侧边距优化”后生效）：
 
@@ -73,7 +76,29 @@ adb shell settings put system cetus_home_pad_opt 1
 adb shell settings put system cetus_home_land_pages 3
 # 边距由 pad_opt 约束方案自动决定（竖 120 / 横 280 或 0），无需手设
 adb shell am force-stop com.miui.home
+adb shell settings put system cetus_home_lockscreen_rot 1
+adb shell pkill -f com.android.systemui
 ```
+
+## 锁屏横屏（内屏展开态）
+
+系统锁屏（内屏/外屏/通知中心/AOD）被 MIUI 对 cetus 的硬编码特判锁死
+竖屏——`NotificationShadeWindowControllerImpl.adjustScreenOrientation`
+中 `|| Build.DEVICE == "cetus"` 恒真，折叠判定与系统旋转设置都无效。
+模块在 SystemUI 进程改写该方法的结果：仅当锁屏请求为竖屏（PORTRAIT）
+且 `State.inLargeScreen`（内屏展开）时改写为 USER，跟随系统自动旋转
+开关与用户旋转设定。
+
+- **范围红线**：折叠态外屏锁屏与解锁态（UNSPECIFIED 路径）一律不改写，
+  行为与原厂完全一致
+- **已知风险**：小米疑似因一代折叠内屏横屏锁屏 UI 未适配而特判，横屏
+  锁屏可能出现布局异常（时钟/日期、壁纸裁切、上滑手势区、相机入口、
+  下拉通知中心）；横屏熄屏 AOD 若异常，可在钩子内加 `mDozing` 跳过条件
+- **故障回退**：关闭"锁屏允许横屏"并重启系统界面
+  （`adb shell pkill -f com.android.systemui`），内外屏行为与原厂一致
+- **验证**：内屏展开+锁屏+横放时
+  `adb shell "dumpsys window windows | grep -A3 'u0 NotificationShade}'" | grep or=`
+  应显示 USER（原版为 PORTRAIT）；折叠态外屏必须仍为 PORTRAIT
 
 ## 签名与校验
 

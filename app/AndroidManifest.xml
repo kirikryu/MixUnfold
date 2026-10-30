@@ -12,9 +12,9 @@
 
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription"
-            android:value="MIX FOLD 1 (cetus): rotation unlock + per-orientation grid tuning, with control panel" />
+            android:value="MIX FOLD 1 (cetus): rotation unlock (launcher + unfolded lockscreen), per-orientation grid tuning, with control panel" />
         <meta-data android:name="xposedminversion" android:value="82" />
-        <meta-data android:name="xposedscope" android:value="com.miui.home" />
+        <meta-data android:name="xposedscope" android:value="com.miui.home;com.android.systemui" />
 
         <activity
             android:name="cetushome.hook.MainActivity"

@@ -39,7 +39,7 @@
 
 ## 3. 钩子清单
 
-全部挂在 `com.miui.home` 进程内（经典 Xposed API）：
+挂在 `com.miui.home` 进程内（经典 Xposed API）：
 
 | # | 目标 | 方式 | 效果 |
 |---|---|---|---|
@@ -58,6 +58,12 @@
 
 另有 `Application.onCreate` after 中注册的进程内广播接收器
 （`cetushome.rotationunlock.RESTART`），供控制面板触发桌面重启。
+
+另一目标进程 `com.android.systemui`（锁屏旋转解锁，根因与风险见第 9 节）：
+
+| # | 目标 | 方式 | 效果 |
+|---|---|---|---|
+| S1 | `NotificationShadeWindowControllerImpl.adjustScreenOrientation`（`hookAllMethods`，避开 State 参数类型耦合） | after | 仅当结果为 PORTRAIT 且 `State.inLargeScreen`（内屏展开）时改写 `mLpChanged.screenOrientation` 为 USER；折叠态外屏锁屏与解锁路径（UNSPECIFIED）一律不改写。总开关 `cetus_home_lockscreen_rot`（默认开），同一轮 `apply()` 内 `applyWindowLayoutParams()` 会把改写后的参数推送上窗 |
 
 ## 4. 反向对齐的几何推导
 
@@ -156,3 +162,47 @@ if (Application.getLauncher() != this) {
   展开态不变（`UNSPECIFIED`，去重为零开销），折叠后立即回落到
   `PORTRAIT` 锁定，与原版外屏行为一致。`Launcher.onResume` 顺带走
   同一去重路径作保险。
+
+## 9. 锁屏旋转的根因与 SystemUI 钩子（S1）
+
+适配 HyperOS V816.0.8.0.TJTCNXM（Android 13）的 MiuiSystemUI。实测
+cetus 的锁屏（内屏展开/外屏折叠/下拉通知中心/bouncer/AOD）全部被锁死
+竖屏，而解锁后旋转链路完全正常；WMS 的方向决策来源正是锁屏窗口
+`NotificationShade`（`deepestLastOrientationSource=Window{NotificationShade}`）。
+
+**根因**（反编译确认）：`NotificationShadeWindowControllerImpl.adjustScreenOrientation`
+在 keyguard 相关分支里：
+
+```java
+if ((MiuiKeyguardUtils.IS_FOLD && !state.inLargeScreen)
+        || Build.DEVICE.equalsIgnoreCase(DeviceConfig.DEVICE_CETUS)) {
+    mLpChanged.screenOrientation = 1;   // PORTRAIT：cetus 无条件命中
+} else if (isKeyguardScreenRotationAllowed()) { … }
+```
+
+`|| DEVICE == "cetus"` 恒真，折叠判定与旋转设置（AOSP `lockscreen.rot_override`
+路径）全部短路失效——只有改写本方法的结果才行。方法在 `apply(State)`
+中部被调用，其后 `applyWindowLayoutParams()` 会 `mLp.copyFrom(mLpChanged)`
+并 `updateViewLayout` 上窗，故 after 钩子里只改 `mLpChanged` 即可，无需
+自行 `setAttributes`。
+
+**门控顺序**（折叠态外屏无条件不动）：
+
+1. 总开关 `cetus_home_lockscreen_rot`（默认开，故障快速关闭）；
+2. `lp.screenOrientation == 1`（PORTRAIT）才处理——解锁路径写
+   `-1`（UNSPECIFIED），天然穿透，保证解锁后行为与原厂一致；
+3. `State.inLargeScreen`（内屏展开）才改写为 `2`（USER，跟随系统自动
+   旋转开关与用户旋转设定）；折叠态外屏的 PORTRAIT 原样保留。
+
+**已知风险与回退**：MIUI 特判 cetus 疑因一代内屏横屏锁屏 UI 未适配。
+横屏锁屏可能布局异常（时钟/壁纸/手势区/相机入口/通知中心）；横屏熄屏
+AOD（`mDozing` 路径）若异常，在 after 内加
+`if (XposedHelpers.getBooleanField(param.args[0], "mDozing")) return;`
+即可回退 AOD 而保留亮屏锁屏旋转；整体不可接受则开关默认关。设置值
+SystemUI 进程内读取一次，关闭开关后重启 SystemUI
+（`pkill -f com.android.systemui`）恢复原厂行为。
+
+**验收**：内屏展开+锁屏+横放
+`dumpsys window windows | grep -A3 'u0 NotificationShade}' | grep or=`
+应为 USER、`dumpsys window | grep mRotation=` 可到 1；折叠态外屏锁屏
+必须仍为 PORTRAIT（无条件回归项）；解锁后旋转与改造前一致。

@@ -3,6 +3,7 @@ package cetushome.hook;
 import android.content.Context;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XC_MethodReplacement;
@@ -48,9 +49,20 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *     sensor-following request from the unfolded session stayed active on
  *     the cover screen (outer-screen rotation, fixed by 1b + 13b together).
  *
- * Settings are read ONCE per launcher process into a static cache and
- * refreshed by restarting the launcher from the module UI — hook bodies
- * must stay cheap because getCellCountX sits on hot layout paths.
+ * A second target is hooked in its own process (com.android.systemui):
+ * S1. NotificationShadeWindowControllerImpl.adjustScreenOrientation after —
+ *     stock hard-codes cetus's keyguard window (bouncer / shade / dozing,
+ *     both screens) to PORTRAIT; the "|| DEVICE == cetus" clause short-
+ *     circuits the fold escape, so the result is rewritten to USER (follow
+ *     auto-rotate) only when the shade State says inLargeScreen (inner
+ *     screen unfolded). The folded cover lockscreen passes through
+ *     untouched, and the unlocked path (UNSPECIFIED) is never modified.
+ *     Governed by the "锁屏允许横屏" switch (cetus_home_lockscreen_rot).
+ *
+ * Settings are read ONCE per process into a static cache and refreshed by
+ * restarting the process (launcher from the module UI; SystemUI via
+ * `pkill -f com.android.systemui`) — hook bodies must stay cheap because
+ * getCellCountX sits on hot layout paths.
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -61,6 +73,7 @@ public class MainHook implements IXposedHookLoadPackage {
     public static final String KEY_PAD_LAND = "cetus_home_padding_side_land";
     public static final String KEY_LAND_PAGES = "cetus_home_land_pages";
     public static final String KEY_PAD_OPT = "cetus_home_pad_opt";
+    public static final String KEY_LOCK_ROT = "cetus_home_lockscreen_rot";
 
     private static Class<?> dcCls;
     private static Class<?> appCls;
@@ -73,6 +86,11 @@ public class MainHook implements IXposedHookLoadPackage {
     private static int cfgPadLand = 120;
     private static int cfgLandPages = 3;
     private static boolean cfgPadOpt;
+
+    // SystemUI-side config: the keyguard switch, read once per SystemUI
+    // process (default ON); disable + restart SystemUI restores stock.
+    private static volatile boolean lockRotCfgLoaded;
+    private static boolean cfgLockRot = true;
 
     private static void log(String msg) {
         XposedBridge.log(TAG + ": " + msg);
@@ -99,6 +117,18 @@ public class MainHook implements IXposedHookLoadPackage {
         log("config loaded: columns=" + cfgColumns + " padPort=" + cfgPadPort
                 + " padLand=" + cfgPadLand + " landPages=" + cfgLandPages
                 + " padOpt=" + cfgPadOpt);
+    }
+
+    /** Keyguard switch for the SystemUI process, read once from the shade
+     *  controller's mContext; the launcher's loadCfg is deliberately not
+     *  touched (launcher keys are meaningless here and vice versa). */
+    private static void loadLockRotCfg(Context ctx) {
+        if (lockRotCfgLoaded || ctx == null) {
+            return;
+        }
+        cfgLockRot = readInt(ctx, KEY_LOCK_ROT, 1) == 1;
+        lockRotCfgLoaded = true;
+        log("systemui config loaded: lockRot=" + cfgLockRot);
     }
 
     private static Context appContext() {
@@ -288,6 +318,10 @@ public class MainHook implements IXposedHookLoadPackage {
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
+        if ("com.android.systemui".equals(lpp.packageName)) {
+            hookSystemUI(lpp);
+            return;
+        }
         if (!"com.miui.home".equals(lpp.packageName)) {
             return;
         }
@@ -830,6 +864,85 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         log("init complete");
+    }
+
+    /**
+     * S1. SystemUI: unlock the unfolded (inner-screen) keyguard orientation.
+     *
+     * Stock adjustScreenOrientation hard-codes cetus's keyguard window
+     * (bouncer / shade / dozing — both screens) to PORTRAIT: the fold
+     * escape "(IS_FOLD && !inLargeScreen)" is short-circuited by the
+     * "|| Build.DEVICE == cetus" clause, so neither the rotation-allowed
+     * setting (KeyguardStateController path) nor inLargeScreen can ever
+     * lift the lock — the method's result must be rewritten after it runs.
+     * hookAllMethods avoids coupling to the State parameter type.
+     *
+     * The after-hook runs mid-apply(): applyWindowLayoutParams() later in
+     * the same apply() copies mLpChanged into the live window params and
+     * pushes them via updateViewLayout, so mutating mLpChanged here is
+     * enough — no setAttributes of our own.
+     *
+     * Gates, in order (the folded cover screen must NEVER be touched):
+     *  1. switch off -> no-op;
+     *  2. stock result must be PORTRAIT — UNSPECIFIED (unlocked paths) and
+     *     every other value pass through untouched, keeping post-unlock
+     *     behavior identical to stock;
+     *  3. State.inLargeScreen — only the unfolded inner screen is rewritten
+     *     to USER (follow the system auto-rotate setting and user rotation);
+     *     the folded cover lockscreen keeps its stock PORTRAIT request.
+     *
+     * Known risk (see README): MIUI likely locks cetus because the gen-1
+     * fold landscape keyguard UI was never adapted. Landscape keyguard may
+     * show layout issues (clock/date, wallpaper crop, swipe-up gesture area,
+     * camera shortcut, notification shade) — verify both orientations live.
+     * If AOD (the mDozing path) misbehaves in landscape, add a mDozing gate
+     * here —
+     *   if (XposedHelpers.getBooleanField(param.args[0], "mDozing")) return;
+     * — which restores stock AOD while the lit lockscreen stays rotatable.
+     * If landscape keyguard proves unusable overall, ship the switch
+     * default-off and note the reason in the module description.
+     */
+    private static void hookSystemUI(XC_LoadPackage.LoadPackageParam lpp) {
+        try {
+            final Class<?> nswcCls = XposedHelpers.findClass(
+                    "com.android.systemui.statusbar.phone.NotificationShadeWindowControllerImpl",
+                    lpp.classLoader);
+            XposedBridge.hookAllMethods(nswcCls, "adjustScreenOrientation",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                loadLockRotCfg((Context) XposedHelpers.getObjectField(
+                                        param.thisObject, "mContext"));
+                                if (!cfgLockRot) {
+                                    return; // switch off: stock behavior everywhere
+                                }
+                                WindowManager.LayoutParams lp =
+                                        (WindowManager.LayoutParams) XposedHelpers.getObjectField(
+                                                param.thisObject, "mLpChanged");
+                                // 1 = SCREEN_ORIENTATION_PORTRAIT; the unlocked
+                                // path writes -1 (UNSPECIFIED) and stays untouched
+                                if (lp.screenOrientation != 1) {
+                                    return;
+                                }
+                                // only the unfolded inner screen — the folded
+                                // cover lockscreen request is never modified
+                                if (!XposedHelpers.getBooleanField(
+                                        param.args[0], "inLargeScreen")) {
+                                    return;
+                                }
+                                lp.screenOrientation = 2; // SCREEN_ORIENTATION_USER
+                                log("keyguard orientation PORTRAIT -> USER"
+                                        + " (inLargeScreen=true)");
+                            } catch (Throwable t) {
+                                log("keyguard rotation hook failed: " + t);
+                            }
+                        }
+                    });
+            log("hook S1 ok: NotificationShadeWindowControllerImpl.adjustScreenOrientation");
+        } catch (Throwable t) {
+            log("hook S1 FAILED: " + t);
+        }
     }
 
     /** Append empty pages until the count is a multiple of the snap unit.
