@@ -186,6 +186,8 @@ echo "[4/6] zipalign"
 "$BT/zipalign" -f -p 4 build/base.apk build/aligned.apk
 
 echo "[5/6] apksigner ($MODE)"
+# OUT 所在目录不随仓库分发（releases/ 被 gitignore），签名前确保存在
+mkdir -p "$(dirname "$OUT")"
 export MIXUNFOLD_KS_PASS="$KS_PASS" MIXUNFOLD_KEY_PASS="$KEY_PASS"
 "$BT/apksigner" sign \
     --ks "$KS" --ks-key-alias "$KS_ALIAS" \
