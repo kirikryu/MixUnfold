@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="cetushome.rotationunlock"
+    android:versionCode="16"
+    android:versionName="1.6.2">
+
+    <uses-sdk android:minSdkVersion="27" android:targetSdkVersion="30" />
+
+    <application
+        android:label="MixUnfold"
+        android:allowBackup="false">
+
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription"
+            android:value="MIX FOLD 1 (cetus): rotation unlock + per-orientation grid tuning, with control panel" />
+        <meta-data android:name="xposedminversion" android:value="82" />
+        <meta-data android:name="xposedscope" android:value="com.miui.home" />
+
+        <activity
+            android:name="cetushome.hook.MainActivity"
+            android:exported="true"
+            android:label="MixUnfold">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

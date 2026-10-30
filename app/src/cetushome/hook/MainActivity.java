@@ -1,0 +1,333 @@
+package cetushome.hook;
+
+import android.app.Activity;
+import android.graphics.Color;
+import android.os.Bundle;
+import android.provider.Settings;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.CompoundButton;
+import android.widget.LinearLayout;
+import android.widget.SeekBar;
+import android.widget.Spinner;
+import android.widget.Switch;
+import android.widget.TextView;
+import android.widget.Toast;
+
+/**
+ * Control panel for the MixUnfold LSPosed module.
+ * Column count is a slider; landscape page count is a two-option spinner;
+ * outer margins are governed by the "外侧边距优化" constraint switch —
+ * users never enter pixel values by hand. All values are written via root
+ * and take effect after "重启系统桌面".
+ */
+public class MainActivity extends Activity {
+
+    private static final String KEY_COLUMNS = MainHook.KEY_COLUMNS;
+    private static final String KEY_PAD_PORT = MainHook.KEY_PAD_PORT;
+    private static final String KEY_PAD_LAND = MainHook.KEY_PAD_LAND;
+    private static final String KEY_LAND_PAGES = MainHook.KEY_LAND_PAGES;
+    private static final String KEY_PAD_OPT = MainHook.KEY_PAD_OPT;
+
+    private int cols = 3, padPort = 120, padLand = 120, landPages = 3;
+    private boolean padOpt = false;
+
+    private TextView colsVal, marginInfo, status;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        cols = read(KEY_COLUMNS, 3);
+        padPort = read(KEY_PAD_PORT, 120);
+        padLand = read(KEY_PAD_LAND, 120);
+        landPages = read(KEY_LAND_PAGES, 3);
+        padOpt = read(KEY_PAD_OPT, 0) == 1;
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(20);
+        root.setPadding(pad, dp(28), pad, pad);
+
+        TextView title = new TextView(this);
+        title.setText("MixUnfold");
+        title.setTextSize(24);
+        title.setTextColor(Color.WHITE);
+        root.addView(title);
+
+        TextView sub = new TextView(this);
+        sub.setText("MIX FOLD 1 桌面增强 · LSPosed 模块");
+        sub.setTextSize(13);
+        sub.setTextColor(0xFF9FB4C7);
+        root.addView(sub);
+
+        root.addView(makeGap());
+
+        colsVal = addSeekBar(root, "桌面单页布局列数", cols, 2, 6, new OnChange() {
+            @Override public void on(int v) { cols = v; }
+        });
+
+        TextView pagesName = new TextView(this);
+        pagesName.setText("横屏页面组配置");
+        pagesName.setTextColor(Color.WHITE);
+        pagesName.setTextSize(15);
+        root.addView(pagesName);
+
+        Spinner pagesSpinner = new Spinner(this);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item,
+                new String[]{"两页", "三页"});
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        pagesSpinner.setAdapter(adapter);
+        pagesSpinner.setSelection(landPages == 3 ? 1 : 0);
+        pagesSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                landPages = pos + 2;
+                updateMarginInfo();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        root.addView(pagesSpinner);
+
+        TextView pagesNote = new TextView(this);
+        pagesNote.setTextSize(13);
+        pagesNote.setTextColor(0xFF9FB4C7);
+        pagesNote.setPadding(dp(8), dp(2), 0, 0);
+        pagesNote.setText("桌面不足 5 页时选三页，末组可能不满——预期行为。");
+        root.addView(pagesNote);
+
+        root.addView(makeGap());
+
+        final Switch optSwitch = new Switch(this);
+        optSwitch.setText("屏幕外侧边距优化");
+        optSwitch.setTextSize(15);
+        optSwitch.setTextColor(Color.WHITE);
+        optSwitch.setChecked(padOpt);
+        optSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
+                padOpt = checked;
+                updateMarginInfo();
+            }
+        });
+        root.addView(optSwitch);
+
+        TextView optDesc = new TextView(this);
+        optDesc.setTextSize(13);
+        optDesc.setTextColor(0xFF9FB4C7);
+        optDesc.setPadding(dp(8), dp(2), 0, 0);
+        optDesc.setText("开启：竖屏外侧边距固定 120px；横屏按页面组适配——两页 280px、三页 0px（三页铺满、页间无缝）。\n"
+                + "关闭：采用小米原版边距方案（原生边距与页缝保留）。");
+        root.addView(optDesc);
+
+        marginInfo = new TextView(this);
+        marginInfo.setTextSize(14);
+        marginInfo.setTextColor(0xFF7EB8FF);
+        marginInfo.setPadding(dp(8), dp(4), 0, 0);
+        root.addView(marginInfo);
+
+        root.addView(makeGap());
+
+        Button apply = makeButton("应用设置（root 写入）");
+        apply.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { apply(); }
+        });
+        root.addView(apply);
+
+        Button restart = makeButton("重启系统桌面");
+        restart.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { restartLauncher(); }
+        });
+        root.addView(restart);
+
+        status = new TextView(this);
+        status.setTextSize(13);
+        status.setTextColor(0xFF9FB4C7);
+        status.setPadding(0, dp(16), 0, 0);
+        status.setText("改完数值点“应用设置”，再点“重启系统桌面”生效。\n"
+                + "重启桌面后，建议横竖屏切换几次，让优化完全应用。\n"
+                + "首次应用会弹出 root 授权，请选择允许。");
+        root.addView(status);
+
+        updateMarginInfo();
+        setContentView(root);
+    }
+
+    /** Effective margins under the constraint scheme; users never enter px. */
+    private int effectivePadPort() {
+        return padOpt ? 120 : 120; // constrained scheme locks portrait at 120
+    }
+
+    private int effectivePadLand() {
+        if (padOpt) {
+            return landPages == 3 ? 0 : 280;
+        }
+        return 120;
+    }
+
+    private void updateMarginInfo() {
+        if (marginInfo == null) {
+            return;
+        }
+        if (padOpt) {
+            marginInfo.setText("竖屏外侧边距：120px（固定）\n横屏外侧边距："
+                    + effectivePadLand() + "px（" + landPages + " 页自动）");
+        } else {
+            marginInfo.setText("优化未开启：竖屏 120px · 横屏 120px（默认）");
+        }
+    }
+
+    private int read(String key, int def) {
+        return Settings.System.getInt(getContentResolver(), key, def);
+    }
+
+    private void apply() {
+        final int port = effectivePadPort();
+        final int land = effectivePadLand();
+        status.setText("正在通过 root 写入…");
+        final String cmd = "settings put system " + KEY_COLUMNS + " " + cols
+                + " && settings put system " + KEY_PAD_OPT + " " + (padOpt ? 1 : 0)
+                + " && settings put system " + KEY_PAD_PORT + " " + port
+                + " && settings put system " + KEY_PAD_LAND + " " + land
+                + " && settings put system " + KEY_LAND_PAGES + " " + landPages;
+        new Thread(new Runnable() {
+            @Override public void run() {
+                boolean ok = false;
+                String err = null;
+                try {
+                    Process p = Runtime.getRuntime().exec("su");
+                    java.io.DataOutputStream os = new java.io.DataOutputStream(p.getOutputStream());
+                    os.writeBytes(cmd + "\n");
+                    os.flush();
+                    os.writeBytes("exit\n");
+                    os.flush();
+                    ok = p.waitFor() == 0;
+                } catch (Throwable t) {
+                    err = String.valueOf(t);
+                }
+                final boolean okF = ok;
+                final String errF = err;
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        if (okF) {
+                            Toast.makeText(MainActivity.this, "已保存，重启桌面后生效",
+                                    Toast.LENGTH_SHORT).show();
+                            status.setText("已保存：桌面 " + cols + " 列；横屏 " + landPages
+                                    + " 页；边距竖 " + port + "px / 横 " + land + "px。");
+                        } else {
+                            status.setText("写入失败（root 未授权？）" + (errF == null ? "" : "：" + errF));
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void restartLauncher() {
+        status.setText("正在重启系统桌面…");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                boolean ok = false;
+                String err = null;
+                try {
+                    // Clean package-level stop + explicit relaunch. A raw
+                    // Process.killProcess() inside the launcher leaves AMS
+                    // state stale (skips fold/orientation callbacks) and
+                    // breaks rotation until a full reboot — force-stop is
+                    // the path that always initializes correctly.
+                    Process p = Runtime.getRuntime().exec("su");
+                    java.io.DataOutputStream os = new java.io.DataOutputStream(p.getOutputStream());
+                    os.writeBytes("am force-stop com.miui.home\n");
+                    os.flush();
+                    // User-identical path: force-stop (same as app-info) then
+                    // a real HOME key event — the system resolves the default
+                    // home itself and reattaches to the native home task.
+                    // Never use `am start -n` here: it creates a task outside
+                    // the home role, which shows up as a stray 系统桌面 card
+                    // in recents.
+                    os.writeBytes("sleep 0.3\n");
+                    os.flush();
+                    os.writeBytes("input keyevent KEYCODE_HOME\n");
+                    os.flush();
+                    os.writeBytes("exit\n");
+                    os.flush();
+                    ok = p.waitFor() == 0;
+                } catch (Throwable t) {
+                    err = String.valueOf(t);
+                }
+                final boolean okF = ok;
+                final String errF = err;
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        if (okF) {
+                            Toast.makeText(MainActivity.this, "系统桌面已重启",
+                                    Toast.LENGTH_SHORT).show();
+                            status.setText("已干净重启（等价于重启手机后的桌面初始化）。");
+                        } else {
+                            status.setText("重启失败（root 未授权？）" + (errF == null ? "" : "：" + errF));
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private interface OnChange {
+        void on(int v);
+    }
+
+    private TextView addSeekBar(LinearLayout root, String label, int value, int min, int max, OnChange cb) {
+        TextView name = new TextView(this);
+        name.setTextColor(Color.WHITE);
+        name.setTextSize(15);
+        root.addView(name);
+
+        final TextView val = new TextView(this);
+        val.setTextColor(0xFF7EB8FF);
+        val.setTextSize(14);
+
+        SeekBar bar = new SeekBar(this);
+        bar.setMax(max - min);
+        bar.setProgress(value - min);
+        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                val.setText(String.valueOf(p + min));
+                cb.on(p + min);
+            }
+            @Override public void onStartTrackingTouch(SeekBar s) {}
+            @Override public void onStopTrackingTouch(SeekBar s) {}
+        });
+        root.addView(bar);
+        val.setGravity(Gravity.END);
+        root.addView(val);
+        name.setText(label);
+        val.setText(String.valueOf(value));
+        return val;
+    }
+
+    private Button makeButton(String text) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setAllCaps(false);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(10);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    private View makeGap() {
+        View v = new View(this);
+        v.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(18)));
+        return v;
+    }
+
+    private int dp(int v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+}

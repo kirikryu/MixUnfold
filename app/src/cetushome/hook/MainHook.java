@@ -1,0 +1,665 @@
+package cetushome.hook;
+
+import android.content.Context;
+import android.view.View;
+import android.view.ViewGroup;
+import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XC_MethodReplacement;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
+import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+/**
+ * LSPosed module for com.miui.home on MIX FOLD 1 (cetus).
+ *
+ * Behavior-only changes — the platform-signed APK is never touched, so all
+ * signature-level privileges stay intact:
+ *
+ *  1. DeviceConfig.updateRotate: stock hard-excludes cetus, leaving the
+ *     unfolded home rotation-locked. Re-derive sRotatable instead.
+ *  2. LauncherCellCountCompatDevice.shouldUseDeviceValue: force true.
+ *  3. Column getters: live single column count (settings-driven).
+ *  4. setWorkspaceCellPadding: tunable bezel while unfolded; DeviceProfile
+ *     receives B/2 so cellWidth = (pageW - B) / columns.
+ *  5. CellLayout alternating alignment: even pages pad B on the left, odd
+ *     pages pad 0 — pages interlock at the seam, so cross-page column pitch
+ *     equals in-page pitch while the screen edges keep the full bezel.
+ *  6/7. Landscape three-page mode (cetus_home_land_pages=3): page width
+ *     becomes screen/3 at creation and on every size/orientation change, so
+ *     the unfolded landscape home shows three cover-style pages.
+ *  8. calcGridSize: in three-page mode the working width follows screen/3.
+ *  9. DeviceConfig.getCellCountX: live column count. Stock caches the count
+ *     at process start and never re-evaluates it on rotation.
+ *  10. Application.onCreate: register an in-process receiver so the module
+ *     UI can cleanly restart the launcher.
+ *  11/12. Even-page policy: pad the page count to a multiple of the current
+ *     snap unit so flipping always lands on a complete pair/triple.
+ *
+ * Settings are read ONCE per launcher process into a static cache and
+ * refreshed by restarting the launcher from the module UI — hook bodies
+ * must stay cheap because getCellCountX sits on hot layout paths.
+ */
+public class MainHook implements IXposedHookLoadPackage {
+
+    private static final String TAG = "CetusHomeHook";
+    public static final String ACTION_RESTART = "cetushome.rotationunlock.RESTART";
+    public static final String KEY_COLUMNS = "cetus_home_columns";
+    public static final String KEY_PAD_PORT = "cetus_home_padding_side";
+    public static final String KEY_PAD_LAND = "cetus_home_padding_side_land";
+    public static final String KEY_LAND_PAGES = "cetus_home_land_pages";
+    public static final String KEY_PAD_OPT = "cetus_home_pad_opt";
+
+    private static Class<?> dcCls;
+    private static Class<?> appCls;
+
+    // process-wide config cache; refreshed by restarting the launcher
+    private static volatile boolean cfgLoaded;
+    private static int cfgColumns = 3;
+    private static int cfgPadPort = 120;
+    private static int cfgPadLand = 120;
+    private static int cfgLandPages = 3;
+    private static boolean cfgPadOpt;
+
+    private static void log(String msg) {
+        XposedBridge.log(TAG + ": " + msg);
+    }
+
+    private static int readInt(Context ctx, String key, int def) {
+        try {
+            return android.provider.Settings.System.getInt(ctx.getContentResolver(), key, def);
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    private static void loadCfg(Context ctx) {
+        if (cfgLoaded || ctx == null) {
+            return;
+        }
+        cfgColumns = readInt(ctx, KEY_COLUMNS, 3);
+        cfgPadPort = readInt(ctx, KEY_PAD_PORT, 120);
+        cfgPadLand = readInt(ctx, KEY_PAD_LAND, 120);
+        cfgLandPages = readInt(ctx, KEY_LAND_PAGES, 3);
+        cfgPadOpt = readInt(ctx, KEY_PAD_OPT, 0) == 1;
+        cfgLoaded = true;
+        log("config loaded: columns=" + cfgColumns + " padPort=" + cfgPadPort
+                + " padLand=" + cfgPadLand + " landPages=" + cfgLandPages
+                + " padOpt=" + cfgPadOpt);
+    }
+
+    private static Context appContext() {
+        try {
+            return (Context) XposedHelpers.callStaticMethod(appCls, "getInstance");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static boolean isLandscape(Context ctx) {
+        return ctx != null && ctx.getResources().getConfiguration().orientation
+                == android.content.res.Configuration.ORIENTATION_LANDSCAPE;
+    }
+
+    /** Authoritative orientation: which DeviceProfile is active right now. */
+    private static boolean profileLandscape() {
+        try {
+            Object profile = XposedHelpers.getStaticObjectField(dcCls, "mActiveProfile");
+            if (profile == null) {
+                return false;
+            }
+            int w = (int) XposedHelpers.callMethod(profile, "getScreenWidth");
+            int h = (int) XposedHelpers.callMethod(profile, "getScreenHeight");
+            return w > h;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static boolean unfoldedLarge(Context ctx) {
+        try {
+            return Boolean.TRUE.equals(XposedHelpers.callStaticMethod(
+                    dcCls, "isInFoldDeviceLargeScreen", ctx));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Three cover-style pages on the unfolded landscape inner screen? */
+    private static boolean threePagesLandscape(Context ctx) {
+        loadCfg(ctx);
+        return unfoldedLarge(ctx) && isLandscape(ctx) && cfgLandPages == 3;
+    }
+
+    /**
+     * Effective outer bezel for the live orientation, under the constraint
+     * scheme: "外侧边距优化" on -> portrait locked at 120, landscape auto by
+     * page count (2 pages = 280, 3 pages = 0 full-bleed); off -> 120 defaults.
+     */
+    private static int bezelFor(Context ctx) {
+        loadCfg(ctx);
+        if (cfgPadOpt) {
+            return isLandscape(ctx) ? (cfgLandPages == 3 ? 0 : 280) : 120;
+        }
+        return isLandscape(ctx) ? cfgPadLand : cfgPadPort;
+    }
+
+    @Override
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
+        if (!"com.miui.home".equals(lpp.packageName)) {
+            return;
+        }
+        dcCls = XposedHelpers.findClass("com.miui.home.launcher.DeviceConfig", lpp.classLoader);
+        appCls = XposedHelpers.findClass("com.miui.home.launcher.Application", lpp.classLoader);
+        log("attached, classLoader=" + lpp.classLoader.getClass().getName());
+
+        // 1. rotation unlock
+        try {
+            XposedHelpers.findAndHookMethod(dcCls, "updateRotate",
+                    Context.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                loadCfg((Context) param.args[0]);
+                                Object inFold = XposedHelpers.callStaticMethod(
+                                        dcCls, "isInFoldDeviceLargeScreen", param.args[0]);
+                                boolean rotatable = Boolean.TRUE.equals(inFold);
+                                XposedHelpers.setStaticBooleanField(dcCls, "sRotatable", rotatable);
+                            } catch (Throwable t) {
+                                log("updateRotate after-hook failed: " + t);
+                            }
+                        }
+                    });
+            log("hook 1 ok: DeviceConfig.updateRotate");
+        } catch (Throwable t) {
+            log("hook 1 FAILED: " + t);
+        }
+
+        // 2. always consult device grid values
+        try {
+            final Class<?> gridBase = XposedHelpers.findClass(
+                    "com.miui.home.launcher.compat.LauncherCellCountCompatDevice", lpp.classLoader);
+            XposedHelpers.findAndHookMethod(gridBase, "shouldUseDeviceValue",
+                    Context.class, int.class, XC_MethodReplacement.returnConstant(true));
+            log("hook 2 ok: shouldUseDeviceValue -> true");
+        } catch (Throwable t) {
+            log("hook 2 FAILED: " + t);
+        }
+
+        // 3. column getters (context variant, feeds loadCellsCountConfig)
+        try {
+            final Class<?> gridBase = XposedHelpers.findClass(
+                    "com.miui.home.launcher.compat.LauncherCellCountCompatDevice", lpp.classLoader);
+            XC_MethodHook columnsHook = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    loadCfg((Context) param.args[0]);
+                    param.setResult(cfgColumns);
+                }
+            };
+            for (String name : new String[]{"getCellCountXDef", "getCellCountXMax", "getCellCountXMin"}) {
+                XposedHelpers.findAndHookMethod(gridBase, name, Context.class, columnsHook);
+            }
+            log("hook 3 ok: base column getters");
+        } catch (Throwable t) {
+            log("hook 3 FAILED: " + t);
+        }
+
+        // 3b. subclass getters
+        try {
+            XC_MethodHook columnsHook2 = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    loadCfg((Context) param.args[0]);
+                    param.setResult(cfgColumns);
+                }
+            };
+            for (String cls : new String[]{
+                    "com.miui.home.launcher.compat.LauncherCellCountCompatDeviceFold",
+                    "com.miui.home.launcher.compat.LauncherCellCountCompatDevicesCetus"}) {
+                final Class<?> c = XposedHelpers.findClass(cls, lpp.classLoader);
+                for (String name : new String[]{
+                        "getCellCountXDefFromDevice", "getCellCountXMaxFromDevice",
+                        "getCellCountXMinFromDevice"}) {
+                    XposedHelpers.findAndHookMethod(c, name, Context.class, columnsHook2);
+                }
+            }
+            log("hook 3b ok: subclass column getters");
+        } catch (Throwable t) {
+            log("hook 3b FAILED: " + t);
+        }
+
+        // 4. tunable bezel while unfolded (DeviceProfile gets B/2)
+        try {
+            XposedHelpers.findAndHookMethod(dcCls, "setWorkspaceCellPadding",
+                    android.content.res.Resources.class, Context.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                Context ctx = (Context) param.args[1];
+                                loadCfg(ctx);
+                                // constraint scheme OFF -> stock padding stands,
+                                // the module does not touch margins at all
+                                if (cfgPadOpt && unfoldedLarge(ctx)) {
+                                    XposedHelpers.setStaticIntField(
+                                            dcCls, "sWorkspaceCellPaddingSide", bezelFor(ctx) / 2);
+                                }
+                            } catch (Throwable t) {
+                                log("padding hook failed: " + t);
+                            }
+                        }
+                    });
+            log("hook 4 ok: setWorkspaceCellPadding");
+        } catch (Throwable t) {
+            log("hook 4 FAILED: " + t);
+        }
+
+        // 5. alternating page alignment (unfolded only); modulo follows the
+        // page count of the current orientation (2 portrait / 2-3 landscape)
+        try {
+            final Class<?> cellLayoutCls = XposedHelpers.findClass(
+                    "com.miui.home.launcher.CellLayout", lpp.classLoader);
+            XC_MethodHook alignHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    try {
+                        View self = (View) param.thisObject;
+                        Object cellScreen = XposedHelpers.callMethod(self, "getParent");
+                        if (cellScreen == null) {
+                            return;
+                        }
+                        Object workspace = XposedHelpers.callMethod(cellScreen, "getParent");
+                        if (workspace == null) {
+                            return;
+                        }
+                        Context app = appContext();
+                        if (app == null) {
+                            return;
+                        }
+                        loadCfg(app);
+                        // alignment is part of the constraint scheme — off
+                        // means stock padding and stock seams everywhere
+                        if (!cfgPadOpt || !unfoldedLarge(app)) {
+                            return;
+                        }
+                        int b = bezelFor(app);
+                        int modulo = isLandscape(app) ? cfgLandPages : 2;
+                        int index = (int) XposedHelpers.callMethod(workspace, "indexOfChild", cellScreen);
+                        XposedHelpers.setIntField(self, "mCellPaddingLeft",
+                                index % modulo == 0 ? b : 0);
+                    } catch (Throwable t) {
+                        log("align failed: " + t);
+                    }
+                }
+            };
+            XposedHelpers.findAndHookMethod(cellLayoutCls, "onScreenOrientationChanged", alignHook);
+            XposedHelpers.findAndHookMethod(cellLayoutCls, "onScreenSizeChanged", alignHook);
+            log("hook 5 ok: CellLayout alternating alignment");
+        } catch (Throwable t) {
+            log("hook 5 FAILED: " + t);
+        }
+
+        // 6/7. page width: screen/2 stock, screen/3 in landscape three-page mode.
+        // Stock never refreshes the width after creation; this also fixes that.
+        try {
+            final Class<?> cellScreenCls = XposedHelpers.findClass(
+                    "com.miui.home.launcher.CellScreen", lpp.classLoader);
+            XC_MethodHook widthHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    try {
+                        View self = (View) (param.thisObject != null
+                                ? param.thisObject : param.getResult());
+                        Context app = appContext();
+                        if (app == null || !unfoldedLarge(app)) {
+                            return;
+                        }
+                        loadCfg(app);
+                        ViewGroup.LayoutParams lp = self.getLayoutParams();
+                        if (lp == null) {
+                            return;
+                        }
+                        int screen = (Integer) XposedHelpers.callStaticMethod(dcCls, "getScreenWidth");
+                        boolean p3 = isLandscape(app) && cfgLandPages == 3;
+                        int pages = p3 ? 3 : 2;
+                        // Solve the page width against ScreenView's own snap
+                        // formula: visibleRange = (content + gap) / (child + gap).
+                        // A plain screen/pages width can round down to one page
+                        // too few, which silently keeps paging in pairs.
+                        int gap = 0;
+                        try {
+                            Object ws = self.getParent();
+                            if (ws != null) {
+                                gap = XposedHelpers.getIntField(ws, "mFixedGap");
+                            }
+                        } catch (Throwable t) {
+                            gap = 0;
+                        }
+                        int w = (screen + gap) / pages - gap;
+                        if (lp.width != w) {
+                            lp.width = w;
+                            self.requestLayout();
+                            if (p3) {
+                                try {
+                                    Object ws = self.getParent();
+                                    int vr = ws == null ? -1
+                                            : XposedHelpers.getIntField(ws, "mVisibleRange");
+                                    int cw = ws == null ? -1
+                                            : XposedHelpers.getIntField(ws, "mChildScreenMeasureWidth");
+                                    log("pages3 width=" + w + " gap=" + gap
+                                            + " visibleRange=" + vr + " childW=" + cw);
+                                } catch (Throwable t) {
+                                    log("pages3 width=" + w + " gap=" + gap);
+                                }
+                            }
+                        }
+                    } catch (Throwable t) {
+                        log("page width hook failed: " + t);
+                    }
+                }
+            };
+            XposedHelpers.findAndHookMethod(cellScreenCls, "createCellScreen",
+                    Context.class, widthHook);
+            XposedHelpers.findAndHookMethod(cellScreenCls, "onScreenSizeChanged", widthHook);
+            XposedHelpers.findAndHookMethod(cellScreenCls, "onScreenOrientationChanged", widthHook);
+            log("hook 6/7 ok: CellScreen page width");
+        } catch (Throwable t) {
+            log("hook 6/7 FAILED: " + t);
+        }
+
+        // 8. three-page mode: grid working width follows screen/3
+        try {
+            XposedHelpers.findAndHookMethod(dcCls, "calcGridSize",
+                    Context.class, boolean.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                Context ctx = (Context) param.args[0];
+                                if (!threePagesLandscape(ctx)) {
+                                    return;
+                                }
+                                Object profile = XposedHelpers.getStaticObjectField(
+                                        dcCls, "mActiveProfile");
+                                if (profile == null) {
+                                    return;
+                                }
+                                // grid span must match the padding the layout
+                                // actually uses (post-hook-4 value: B/2 when
+                                // the constraint scheme is on, stock 83 else)
+                                int pad = (Integer) XposedHelpers.callStaticMethod(
+                                        dcCls, "getWorkspaceCellPaddingSide");
+                                int bw = (Integer) XposedHelpers.callStaticMethod(
+                                        dcCls, "getScreenWidth") / 3 - 2 * pad;
+                                XposedHelpers.callMethod(profile, "setCellWorkingWidth", bw);
+                                XposedHelpers.callMethod(profile, "calculateCellSize", ctx);
+                            } catch (Throwable t) {
+                                log("calcGridSize hook failed: " + t);
+                            }
+                        }
+                    });
+            log("hook 8 ok: calcGridSize three-page working width");
+        } catch (Throwable t) {
+            log("hook 8 FAILED: " + t);
+        }
+
+        // 9. live column count (see class doc, item 9)
+        try {
+            XposedHelpers.findAndHookMethod(dcCls, "getCellCountX", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    loadCfg(appContext());
+                    param.setResult(cfgColumns);
+                }
+            });
+            log("hook 9 ok: getCellCountX live");
+        } catch (Throwable t) {
+            log("hook 9 FAILED: " + t);
+        }
+
+        // 10. in-process restart receiver (module UI -> clean launcher restart)
+        try {
+            XC_MethodHook regHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    try {
+                        Context ctx0 = (Context) param.thisObject;
+                        android.content.IntentFilter f =
+                                new android.content.IntentFilter(ACTION_RESTART);
+                        ctx0.registerReceiver(new android.content.BroadcastReceiver() {
+                            @Override
+                            public void onReceive(android.content.Context c, android.content.Intent i) {
+                                log("restart requested, killing launcher process");
+                                android.os.Process.killProcess(android.os.Process.myPid());
+                            }
+                        }, f);
+                        log("restart receiver registered");
+                    } catch (Throwable t) {
+                        log("restart receiver FAILED: " + t);
+                    }
+                }
+            };
+            XposedHelpers.findAndHookMethod(appCls, "onCreate", regHook);
+            log("hook 10 ok: Application.onCreate (restart receiver)");
+        } catch (Throwable t) {
+            log("hook 10 FAILED: " + t);
+        }
+
+        // 11/12. even-page policy: keep the page count a multiple of the
+        // current orientation's snap unit so flipping always lands on a
+        // complete pair/triple and no lone last page ever exists.
+        try {
+            final Class<?> launcherCls = XposedHelpers.findClass(
+                    "com.miui.home.launcher.Launcher", lpp.classLoader);
+            final Class<?> workspaceCls = XposedHelpers.findClass(
+                    "com.miui.home.launcher.Workspace", lpp.classLoader);
+            XC_MethodHook resumeHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    try {
+                        Object workspace = XposedHelpers.getObjectField(
+                                param.thisObject, "mWorkspace");
+                        if (workspace == null) {
+                            return;
+                        }
+                        View wv = (View) workspace;
+                        wv.post(new Runnable() {
+                            @Override public void run() {
+                                ensureEvenPages(workspace);
+                            }
+                        });
+                    } catch (Throwable t) {
+                        log("resume even-pages FAILED: " + t);
+                    }
+                }
+            };
+            XposedHelpers.findAndHookMethod(launcherCls, "onResume", resumeHook);
+            XposedHelpers.findAndHookMethod(workspaceCls, "reorderScreens",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            ensureEvenPages(param.thisObject);
+                        }
+                    });
+            log("hook 11/12 ok: even-page policy");
+        } catch (Throwable t) {
+            log("hook 11/12 FAILED: " + t);
+        }
+
+        // 13. Launcher.checkDualScreen re-asserts stock page width
+        // (screen/2) on every config change, overriding hook 6/7 — re-apply
+        // the three-page width after it runs.
+        //
+        // 15/16 (same block below): veto hooks on Workspace.deleteScreen /
+        // removeScreen — stock prunes trailing empty pages on edit-mode
+        // entry/exit, which discarded our parity page.
+        try {
+            final Class<?> launcherCls2 = XposedHelpers.findClass(
+                    "com.miui.home.launcher.Launcher", lpp.classLoader);
+            XC_MethodHook dualHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    try {
+                        Context ctx = (Context) param.thisObject;
+                        if (!threePagesLandscape(ctx)) {
+                            return;
+                        }
+                        Object workspace = XposedHelpers.getObjectField(
+                                param.thisObject, "mWorkspace");
+                        if (workspace == null) {
+                            return;
+                        }
+                        int screen = (Integer) XposedHelpers.callStaticMethod(
+                                dcCls, "getScreenWidth");
+                        int count = (Integer) XposedHelpers.callMethod(
+                                workspace, "getScreenCount");
+                        for (int i = 0; i < count; i++) {
+                            View page = (View) XposedHelpers.callMethod(
+                                    workspace, "getChildAt", i);
+                            ViewGroup.LayoutParams lp = page.getLayoutParams();
+                            if (lp != null && lp.width != screen / 3) {
+                                lp.width = screen / 3;
+                                page.requestLayout();
+                            }
+                        }
+                    } catch (Throwable t) {
+                        log("dualScreen hook failed: " + t);
+                    }
+                }
+            };
+            XposedHelpers.findAndHookMethod(launcherCls2, "checkDualScreen", dualHook);
+            log("hook 13 ok: checkDualScreen width re-apply");
+        } catch (Throwable t) {
+            log("hook 13 FAILED: " + t);
+        }
+
+        // 14. triple snap: FoldScreenIndexCalculator hard-codes "% 2" pair
+        // calibration (and even forces the last page back by one), which
+        // fights three-page mode. In that mode snap to triple boundaries.
+        try {
+            final Class<?> calcCls = XposedHelpers.findClass(
+                    "com.miui.home.launcher.util.FoldScreenIndexCalculator", lpp.classLoader);
+            XposedHelpers.findAndHookMethod(calcCls, "obtainValidCurrentScreenIndex",
+                    int.class, int.class, int.class, boolean.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                Context app = appContext();
+                                if (!threePagesLandscape(app)) {
+                                    return;
+                                }
+                                int idx = (Integer) param.args[0];
+                                int count = (Integer) param.args[1];
+                                int clamped = Math.max(0, Math.min(idx, count - 1));
+                                param.setResult(clamped - clamped % 3);
+                            } catch (Throwable t) {
+                                log("foldIdx hook failed: " + t);
+                            }
+                        }
+                    });
+            log("hook 14 ok: FoldScreenIndexCalculator triple snap");
+        } catch (Throwable t) {
+            log("hook 14 FAILED: " + t);
+        }
+
+        // 15/16. even-page veto: block removal of the trailing EMPTY page
+        // when removing it would break the snap-unit parity. Non-empty
+        // pages (user content) always remain removable.
+        try {
+            final Class<?> workspaceCls2 = XposedHelpers.findClass(
+                    "com.miui.home.launcher.Workspace", lpp.classLoader);
+            XC_MethodHook vetoHook = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    try {
+                        Context app = appContext();
+                        if (app == null || !unfoldedLarge(app) || !cfgPadOpt) {
+                            return;
+                        }
+                        loadCfg(app);
+                        // parity lock is a portrait two-up feature; landscape
+                        // three-page mode pages freely (no veto, no parity)
+                        if (isLandscape(app) && cfgLandPages == 3) {
+                            return;
+                        }
+                        Object ws = param.thisObject;
+                        int count = (Integer) XposedHelpers.callMethod(ws, "getScreenCount");
+                        if (count <= 1) {
+                            return;
+                        }
+                        int modulo = isLandscape(app) ? cfgLandPages : 2;
+                        int idx;
+                        if (param.args[0] instanceof Long) {
+                            idx = (Integer) XposedHelpers.callMethod(
+                                    ws, "getScreenIndexById", (Long) param.args[0]);
+                        } else {
+                            idx = (Integer) param.args[0];
+                        }
+                        if (idx != count - 1 || (count - 1) % modulo == 0) {
+                            return; // not the trailing page, or removal keeps parity
+                        }
+                        Object cellScreen = XposedHelpers.callMethod(ws, "getCellScreen", idx);
+                        Object layout = cellScreen == null ? null
+                                : XposedHelpers.callMethod(cellScreen, "getCellLayout");
+                        int children = layout == null ? -1
+                                : (Integer) XposedHelpers.callMethod(layout, "getChildCount");
+                        if (children != 0) {
+                            return; // non-empty: user content, allow removal
+                        }
+                        log("even-pages: vetoed removal of trailing parity page (count="
+                                + count + ")");
+                        param.setResult(null);
+                    } catch (Throwable t) {
+                        log("even-page veto failed: " + t);
+                    }
+                }
+            };
+            XposedHelpers.findAndHookMethod(workspaceCls2, "deleteScreen",
+                    long.class, vetoHook);
+            XposedHelpers.findAndHookMethod(workspaceCls2, "removeScreen",
+                    int.class, vetoHook);
+            log("hook 15/16 ok: even-page removal veto");
+        } catch (Throwable t) {
+            log("hook 15/16 FAILED: " + t);
+        }
+
+        log("init complete");
+    }
+
+    /** Append empty pages until the count is a multiple of the snap unit.
+     *  Enforced for portrait two-up only; landscape three-page mode pages
+     *  freely (no parity lock), per design decision. */
+    private static void ensureEvenPages(Object workspace) {
+        try {
+            Context app = appContext();
+            if (app == null || !unfoldedLarge(app)) {
+                return;
+            }
+            loadCfg(app);
+            if (isLandscape(app) && cfgLandPages == 3) {
+                return; // three-page mode: free paging, no parity lock
+            }
+            if ((boolean) XposedHelpers.callMethod(workspace, "isInNormalEditingMode")) {
+                return;
+            }
+            int modulo = 2;
+            int count = (int) XposedHelpers.callMethod(workspace, "getScreenCount");
+            int deficit = (modulo - count % modulo) % modulo;
+            for (int i = 0; i < deficit; i++) {
+                XposedHelpers.callMethod(workspace, "insertNewScreen", count + i);
+            }
+            if (deficit > 0) {
+                log("even-pages: appended " + deficit + ", count " + count
+                        + " -> " + (count + deficit));
+            }
+        } catch (Throwable t) {
+            log("ensureEvenPages failed: " + t);
+        }
+    }
+
+    private static void XposedHooks_addCellScreenWidthRefresh(Class<?> cellScreenCls,
+                                                              XC_MethodHook widthHook) {
+        XposedHelpers.findAndHookMethod(cellScreenCls, "onScreenSizeChanged", widthHook);
+        XposedHelpers.findAndHookMethod(cellScreenCls, "onScreenOrientationChanged", widthHook);
+    }
+}

@@ -1,0 +1,8 @@
+build/
+releases/
+keystore/
+.DS_Store
+*.iml
+.zcode/
+.v2c/
+.video_agent/
