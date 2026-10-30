@@ -17,7 +17,13 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * signature-level privileges stay intact:
  *
  *  1. DeviceConfig.updateRotate: stock hard-excludes cetus, leaving the
- *     unfolded home rotation-locked. Re-derive sRotatable instead.
+ *     unfolded home rotation-locked. Re-derive sRotatable instead — from the
+ *     live launcher display, not the application context (see 1b).
+ *  1b. DeviceConfig.isRotatable: re-derive the fold state at every read.
+ *     Stock caches a process-wide static from the application-context
+ *     configuration, which does not track fold transitions; after unfolding,
+ *     the cover screen inherited rotatable=true and rotated too. Consumed
+ *     live from the display the launcher is on right now.
  *  2. LauncherCellCountCompatDevice.shouldUseDeviceValue: force true.
  *  3. Column getters: live single column count (settings-driven).
  *  4. setWorkspaceCellPadding: tunable bezel while unfolded; DeviceProfile
@@ -35,6 +41,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *     UI can cleanly restart the launcher.
  *  11/12. Even-page policy: pad the page count to a multiple of the current
  *     snap unit so flipping always lands on a complete pair/triple.
+ *  13b. Launcher.onConfigurationChanged / onResume: re-run the orientation
+ *     request decision. The launcher declares every config change (never
+ *     recreates) and stock RotationHelper.onConfigurationChanged is an
+ *     empty stub — so a fold transition never re-issued the request and the
+ *     sensor-following request from the unfolded session stayed active on
+ *     the cover screen (outer-screen rotation, fixed by 1b + 13b together).
  *
  * Settings are read ONCE per launcher process into a static cache and
  * refreshed by restarting the launcher from the module UI — hook bodies
@@ -52,6 +64,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static Class<?> dcCls;
     private static Class<?> appCls;
+    private static Class<?> uiThreadCls;
 
     // process-wide config cache; refreshed by restarting the launcher
     private static volatile boolean cfgLoaded;
@@ -125,10 +138,139 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    /** The live Launcher activity as a Context, or null (it is the one
+     *  Context whose Resources always track the display home is on). */
+    private static Context launcherContext() {
+        try {
+            return (Context) XposedHelpers.callStaticMethod(appCls, "getLauncher");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Fold state at decision time: is the display home is on right now the
+     * large (inner) one? Stock derives sRotatable once per updateRotate call
+     * from the application-context configuration, which goes stale across
+     * fold transitions — after unfolding, the cover screen inherited
+     * rotatable=true and rotated too. sm screenWidthDp is ground truth of
+     * the live display config (cetus: inner ≈654dp, cover ≈393dp); MIUI's
+     * own large-screen evaluator on the live context is the fallback.
+     * Returns null when nothing can be evaluated yet — callers then keep
+     * the stock value instead of guessing.
+     */
+    private static Boolean evaluateRotatable() {
+        Context ctx = launcherContext();
+        if (ctx == null) {
+            ctx = appContext();
+        }
+        if (ctx == null) {
+            return null;
+        }
+        boolean miui = unfoldedLarge(ctx);
+        try {
+            int sw = ctx.getResources().getConfiguration().smallestScreenWidthDp;
+            if (sw > 0) {
+                boolean large = sw >= 600;
+                if (large != miui) {
+                    log("fold-state disagree: miui=" + miui + " sw=" + sw + "dp -> " + large);
+                }
+                return large;
+            }
+        } catch (Throwable ignored) {
+        }
+        return miui;
+    }
+
+    /**
+     * Fold-state gate for the page/padding/parity hooks, shared by every
+     * call site so they cannot disagree. Uses the live launcher display
+     * (see evaluateRotatable); when the launcher does not exist yet
+     * (process-start paths) falls back to MIUI's evaluator on the given
+     * context, preserving pre-1.6.4 behavior.
+     */
+    private static boolean onInnerScreen(Context fallbackCtx) {
+        Boolean live = evaluateRotatable();
+        if (live != null) {
+            return live;
+        }
+        return unfoldedLarge(fallbackCtx);
+    }
+
+    /** RotationHelper.getScreenOrientationByRequest: 2 → LOCKED(14),
+     *  3 → PORTRAIT, anything else → UNSPECIFIED. */
+    private static int orientationForRequest(int request) {
+        if (request == 2) {
+            return 14;
+        }
+        if (request == 3) {
+            return 1;
+        }
+        return -1;
+    }
+
+    /**
+     * Re-run RotationHelper.notifyChange's decision for the given launcher.
+     * notifyChange is private and every public re-entry point dedupes on
+     * unchanged state, which a fold transition can leave untouched — so the
+     * decision is replicated here exactly and the request re-issued only
+     * when the resulting orientation actually changed:
+     * rotatable → UNSPECIFIED (follow auto-rotate); otherwise whatever the
+     * state machine has pending (idle → PORTRAIT, the stock cover behavior).
+     *
+     * The helper is reached by FIELD access only: enumerating Launcher's
+     * methods (XposedHelpers.callMethod) resolves every method signature of
+     * the class, and on HyperOS builds Launcher.getNewHomeView()'s return
+     * type drags in the optional NewHomeView plugin classes →
+     * NoClassDefFoundError on every call. Field enumeration resolves names
+     * lazily and is safe.
+     */
+    private static void renotifyRotationRequest(Object launcher) {
+        try {
+            Boolean live = evaluateRotatable();
+            if (live == null) {
+                return; // cannot decide — leave the stock state machine alone
+            }
+            XposedHelpers.setStaticBooleanField(dcCls, "sRotatable", live);
+            boolean rotatable = live;
+            Object helper = XposedHelpers.getObjectField(launcher, "mRotationHelper");
+            if (helper == null) {
+                return;
+            }
+            int multi = XposedHelpers.getIntField(helper, "mMultiWindowRotationRequest");
+            int trans = XposedHelpers.getIntField(helper, "mCurrentTransitionRequest");
+            int state = XposedHelpers.getIntField(helper, "mCurrentStateRequest");
+            int flag;
+            if (rotatable) {
+                flag = -1;
+            } else if (multi != 0) {
+                flag = orientationForRequest(multi);
+            } else if (trans != 0) {
+                flag = orientationForRequest(trans);
+            } else if (state == 2) {
+                flag = 14;
+            } else if (state == 1) {
+                flag = (Boolean) XposedHelpers.callStaticMethod(dcCls, "isInMultiWindowMode")
+                        ? -1 : 3;
+            } else {
+                flag = 1;
+            }
+            int last = XposedHelpers.getIntField(helper, "mLastActivityFlags");
+            if (flag != last) {
+                XposedHelpers.setIntField(helper, "mLastActivityFlags", flag);
+                XposedHelpers.callStaticMethod(uiThreadCls, "setOrientationAsync",
+                        launcher, flag);
+                log("renotify: flag " + last + " -> " + flag);
+            }
+        } catch (Throwable t) {
+            log("renotify failed: " + t);
+        }
+    }
+
     /** Three cover-style pages on the unfolded landscape inner screen? */
     private static boolean threePagesLandscape(Context ctx) {
         loadCfg(ctx);
-        return unfoldedLarge(ctx) && isLandscape(ctx) && cfgLandPages == 3;
+        return onInnerScreen(ctx) && isLandscape(ctx) && cfgLandPages == 3;
     }
 
     /**
@@ -151,9 +293,12 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         dcCls = XposedHelpers.findClass("com.miui.home.launcher.DeviceConfig", lpp.classLoader);
         appCls = XposedHelpers.findClass("com.miui.home.launcher.Application", lpp.classLoader);
+        uiThreadCls = XposedHelpers.findClass(
+                "com.miui.home.launcher.util.UiThreadHelper", lpp.classLoader);
         log("attached, classLoader=" + lpp.classLoader.getClass().getName());
 
-        // 1. rotation unlock
+        // 1. rotation unlock — keep the static itself consistent, derived
+        // from the live launcher display (see 1b for why)
         try {
             XposedHelpers.findAndHookMethod(dcCls, "updateRotate",
                     Context.class, new XC_MethodHook() {
@@ -161,9 +306,11 @@ public class MainHook implements IXposedHookLoadPackage {
                         protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
                             try {
                                 loadCfg((Context) param.args[0]);
-                                Object inFold = XposedHelpers.callStaticMethod(
-                                        dcCls, "isInFoldDeviceLargeScreen", param.args[0]);
-                                boolean rotatable = Boolean.TRUE.equals(inFold);
+                                Boolean live = evaluateRotatable();
+                                boolean rotatable = live != null
+                                        ? live
+                                        : Boolean.TRUE.equals(XposedHelpers.callStaticMethod(
+                                        dcCls, "isInFoldDeviceLargeScreen", param.args[0]));
                                 XposedHelpers.setStaticBooleanField(dcCls, "sRotatable", rotatable);
                             } catch (Throwable t) {
                                 log("updateRotate after-hook failed: " + t);
@@ -173,6 +320,35 @@ public class MainHook implements IXposedHookLoadPackage {
             log("hook 1 ok: DeviceConfig.updateRotate");
         } catch (Throwable t) {
             log("hook 1 FAILED: " + t);
+        }
+
+        // 1b. live fold state: re-derive at every read. The stock static is
+        // computed once per updateRotate from the application context, whose
+        // configuration does not track fold transitions — the consumption
+        // point must see the display home is on right now.
+        try {
+            XposedHelpers.findAndHookMethod(dcCls, "isRotatable", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    try {
+                        Boolean live = evaluateRotatable();
+                        if (live == null) {
+                            return;
+                        }
+                        Object curObj = XposedHelpers.getStaticObjectField(dcCls, "sRotatable");
+                        boolean cur = Boolean.TRUE.equals(curObj);
+                        if (cur != live) {
+                            log("rotatable " + cur + " -> " + live);
+                        }
+                        param.setResult(live);
+                    } catch (Throwable t) {
+                        log("isRotatable hook failed: " + t);
+                    }
+                }
+            });
+            log("hook 1b ok: DeviceConfig.isRotatable live fold state");
+        } catch (Throwable t) {
+            log("hook 1b FAILED: " + t);
         }
 
         // 2. always consult device grid values
@@ -240,7 +416,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 loadCfg(ctx);
                                 // constraint scheme OFF -> stock padding stands,
                                 // the module does not touch margins at all
-                                if (cfgPadOpt && unfoldedLarge(ctx)) {
+                                if (cfgPadOpt && onInnerScreen(ctx)) {
                                     XposedHelpers.setStaticIntField(
                                             dcCls, "sWorkspaceCellPaddingSide", bezelFor(ctx) / 2);
                                 }
@@ -279,7 +455,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         loadCfg(app);
                         // alignment is part of the constraint scheme — off
                         // means stock padding and stock seams everywhere
-                        if (!cfgPadOpt || !unfoldedLarge(app)) {
+                        if (!cfgPadOpt || !onInnerScreen(app)) {
                             return;
                         }
                         int b = bezelFor(app);
@@ -311,7 +487,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         View self = (View) (param.thisObject != null
                                 ? param.thisObject : param.getResult());
                         Context app = appContext();
-                        if (app == null || !unfoldedLarge(app)) {
+                        if (app == null || !onInnerScreen(app)) {
                             return;
                         }
                         loadCfg(app);
@@ -456,6 +632,14 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
                     try {
+                        // insurance for fold transitions that somehow skipped
+                        // the config-change re-request (deduped, no-op when
+                        // the orientation already matches)
+                        renotifyRotationRequest(param.thisObject);
+                    } catch (Throwable t) {
+                        log("resume renotify FAILED: " + t);
+                    }
+                    try {
                         Object workspace = XposedHelpers.getObjectField(
                                 param.thisObject, "mWorkspace");
                         if (workspace == null) {
@@ -532,6 +716,28 @@ public class MainHook implements IXposedHookLoadPackage {
             log("hook 13 FAILED: " + t);
         }
 
+        // 13b. re-issue the orientation request on config changes. The
+        // launcher handles every config change itself (no recreation) and
+        // stock RotationHelper.onConfigurationChanged is an empty stub —
+        // after a fold transition nothing re-evaluated sRotatable, so the
+        // sensor-following request from the unfolded session kept rotating
+        // the cover screen.
+        try {
+            final Class<?> launcherCls3 = XposedHelpers.findClass(
+                    "com.miui.home.launcher.Launcher", lpp.classLoader);
+            XC_MethodHook renotifyHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    renotifyRotationRequest(param.thisObject);
+                }
+            };
+            XposedHelpers.findAndHookMethod(launcherCls3, "onConfigurationChanged",
+                    android.content.res.Configuration.class, renotifyHook);
+            log("hook 13b ok: Launcher.onConfigurationChanged rotation re-request");
+        } catch (Throwable t) {
+            log("hook 13b FAILED: " + t);
+        }
+
         // 14. triple snap: FoldScreenIndexCalculator hard-codes "% 2" pair
         // calibration (and even forces the last page back by one), which
         // fights three-page mode. In that mode snap to triple boundaries.
@@ -573,7 +779,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
                     try {
                         Context app = appContext();
-                        if (app == null || !unfoldedLarge(app) || !cfgPadOpt) {
+                        if (app == null || !onInnerScreen(app) || !cfgPadOpt) {
                             return;
                         }
                         loadCfg(app);
@@ -632,7 +838,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void ensureEvenPages(Object workspace) {
         try {
             Context app = appContext();
-            if (app == null || !unfoldedLarge(app)) {
+            if (app == null || !onInnerScreen(app)) {
                 return;
             }
             loadCfg(app);
