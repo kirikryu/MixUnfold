@@ -54,7 +54,10 @@
 | 9 | `DeviceConfig.getCellCountX` | before→实时列数 | 原生列数进程启动后缓存且旋转不重读；设置值进程内缓存一次，热路径零额外查询 |
 | 10 | `Application.onCreate` | after | 注册进程内重启广播接收器 |
 | 11/12 | `Launcher.onResume` / `Workspace.reorderScreens` | after | 偶数页策略：页数不足翻页单位时末尾补空白页（编辑模式跳过）；onResume 顺带触发 13b 的方向重发（去重，无开销） |
+| 13 | `Launcher.checkDualScreen` | after | 三页模式下把每页页宽重新设为 `屏宽/3`：原生在每次配置变化后重断言页宽 `屏宽/2`，会覆盖钩子 6/7 的结果 |
 | 13b | `Launcher.onConfigurationChanged` | after | 折叠/展开切换后重跑方向请求决策（复刻 `RotationHelper.notifyChange` 并按 `mLastActivityFlags` 去重） |
+| 14 | `FoldScreenIndexCalculator.obtainValidCurrentScreenIndex` | before | 三页模式下吸附目标改为 3 页组边界（原生硬编码 `% 2` 成对校准并强制末页回退一位）；非三页模式不动 |
+| 15/16 | `Workspace.deleteScreen(long)` / `removeScreen(int)` | before | 偶数页保护：移除末页会破坏翻页单位奇偶、且该页为空白页时否决移除（非空页始终放行）；仅展开态且「外侧边距优化」开启时生效，横屏三页模式不启用 |
 
 另有 `Application.onCreate` after 中注册的进程内广播接收器
 （`cetushome.rotationunlock.RESTART`），供控制面板触发桌面重启。
@@ -131,7 +134,7 @@ if (Application.getLauncher() != this) {
 与本模块无关（崩溃缓冲区无记录、模块接收器未触发、调用栈纯原生）。
 伴随特征：整机 swap 高占用、load 飙升、某前台应用失控占用 CPU。
 
-## 8. 外屏误旋转的根因与修正（v1.6.3）
+## 8. 外屏误旋转的根因与修正（v1.6.4）
 
 预期是"外屏正常（锁定竖屏）、展开内屏跟随系统旋转"，实测展开后再折叠，
 外屏桌面也能转到横屏。逆向结论（4.39.12）：

@@ -305,15 +305,13 @@ public class MainHook implements IXposedHookLoadPackage {
 
     /**
      * Effective outer bezel for the live orientation, under the constraint
-     * scheme: "外侧边距优化" on -> portrait locked at 120, landscape auto by
-     * page count (2 pages = 280, 3 pages = 0 full-bleed); off -> 120 defaults.
+     * scheme: portrait locked at 120, landscape auto by page count
+     * (2 pages = 280, 3 pages = 0 full-bleed). Callers gate on cfgPadOpt —
+     * with "外侧边距优化" off the module touches no margins at all.
      */
     private static int bezelFor(Context ctx) {
         loadCfg(ctx);
-        if (cfgPadOpt) {
-            return isLandscape(ctx) ? (cfgLandPages == 3 ? 0 : 280) : 120;
-        }
-        return isLandscape(ctx) ? cfgPadLand : cfgPadPort;
+        return isLandscape(ctx) ? (cfgLandPages == 3 ? 0 : 280) : 120;
     }
 
     @Override
@@ -976,9 +974,4 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void XposedHooks_addCellScreenWidthRefresh(Class<?> cellScreenCls,
-                                                              XC_MethodHook widthHook) {
-        XposedHelpers.findAndHookMethod(cellScreenCls, "onScreenSizeChanged", widthHook);
-        XposedHelpers.findAndHookMethod(cellScreenCls, "onScreenOrientationChanged", widthHook);
-    }
 }
