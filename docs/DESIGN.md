@@ -340,9 +340,11 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
   化到自身设置文件。同步在配置线程执行（避免 WMS 锁内做 PM 查询）。
 - **总开关语义**：关 → `isEnabled()` 恢复 false → 引擎休眠、全机原厂
   （允许表文件残留但引擎不读，无行为影响）。
-- **已知限制**：新安装应用在下次允许表同步（重启或排除变更）前不跟随
-  内屏旋转——后续可监听 PACKAGE_ADDED 增量同步；外屏 LOCKED 对在折叠
-  事件时应用，开机即折叠的场景需一次折叠循环生效。
+- **已知限制**：引擎允许表在开机首次 isEnabled 调用与排除清单变更时全量
+  重建，新安装应用需一次重启或任意排除变更才跟随内屏旋转（后续可加
+  PACKAGE_ADDED 增量同步；选择器自身的应用列表已实时刷新：onResume 重查
+  + 安装/替换/卸载广播）；外屏 LOCKED 对在折叠事件时应用，开机即折叠的
+  场景需一次折叠循环生效。
 - **侦察记录**：`MiuiStubUtil` 与引擎策略不在 services.jar（在
   miui-services.jar / miui-framework），`TaskSnapshot` 类在 system_server
   类加载器不可解析（W5 按名挂钩的原因）；引擎模式下 `systemContext()`

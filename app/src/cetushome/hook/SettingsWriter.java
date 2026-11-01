@@ -30,6 +30,10 @@ final class SettingsWriter {
             }
         } catch (Throwable ignored) {
         }
-        return RootWriter.write("settings put system " + key + " " + value + "\n");
+        // the exclusion list is ';'-joined and ';' is a shell command
+        // separator — unquoted, `settings` stores only the first package and
+        // the rest is executed as a (failing) command. Values written here
+        // are internal (ints, package lists), never containing a quote.
+        return RootWriter.write("settings put system " + key + " '" + value + "'\n");
     }
 }

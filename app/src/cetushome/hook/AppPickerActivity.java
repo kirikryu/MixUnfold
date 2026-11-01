@@ -1,7 +1,10 @@
 package cetushome.hook;
 
 import android.app.Activity;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
@@ -40,6 +43,13 @@ public class AppPickerActivity extends Activity {
     private Button grantBtn;
     private AppAdapter apps;
     private final HashSet<String> excluded = new HashSet<String>();
+    /** Serialized write+verify tasks; writeSeq guards stale verifications. */
+    private final java.util.concurrent.ExecutorService writeExec =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+    private volatile int writeSeq;
+    /** Loader generation: only the newest query may repaint the list. */
+    private volatile int loadSeq;
+    private BroadcastReceiver pkgObs;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -52,14 +62,7 @@ public class AppPickerActivity extends Activity {
 
         String raw = Settings.System.getString(getContentResolver(),
                 MainHook.KEY_ROT_EXCLUDE);
-        if (raw != null) {
-            for (String s : raw.split(";")) {
-                s = s.trim();
-                if (!s.isEmpty()) {
-                    excluded.add(s);
-                }
-            }
-        }
+        excluded.addAll(parseExclude(raw));
 
         apps = new AppAdapter();
 
@@ -150,13 +153,44 @@ public class AppPickerActivity extends Activity {
 
         setContentView(root);
         updateCount();
-        loadAppsAsync();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         refreshGrantUi();
+        // reload on every return: the picker often survives in background
+        // while new apps are installed, and onCreate ran only once
+        loadAppsAsync();
+        if (pkgObs == null) {
+            // install/replace/remove finishing while the page is open
+            pkgObs = new BroadcastReceiver() {
+                @Override public void onReceive(Context context, Intent intent) {
+                    loadAppsAsync();
+                }
+            };
+            IntentFilter f = new IntentFilter();
+            f.addAction(Intent.ACTION_PACKAGE_ADDED);
+            f.addAction(Intent.ACTION_PACKAGE_REPLACED);
+            f.addAction(Intent.ACTION_PACKAGE_REMOVED);
+            f.addDataScheme("package");
+            registerReceiver(pkgObs, f);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        if (pkgObs != null) {
+            unregisterReceiver(pkgObs);
+            pkgObs = null;
+        }
+        super.onPause();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        writeExec.shutdownNow();
     }
 
     private void refreshGrantUi() {
@@ -171,6 +205,7 @@ public class AppPickerActivity extends Activity {
     }
 
     private void loadAppsAsync() {
+        final int seq = ++loadSeq;
         new Thread(new Runnable() {
             @Override public void run() {
                 final ArrayList<AppItem> loaded = new ArrayList<AppItem>();
@@ -196,7 +231,16 @@ public class AppPickerActivity extends Activity {
                 });
                 runOnUiThread(new Runnable() {
                     @Override public void run() {
+                        if (seq != loadSeq) {
+                            return; // a newer load already decided the list
+                        }
                         apps.setData(loaded);
+                        if (loaded.isEmpty()) {
+                            // MIUI 「读取应用列表」denied returns a near-empty set
+                            Toast.makeText(AppPickerActivity.this,
+                                    "未读取到应用列表，请检查系统的「读取应用列表」权限",
+                                    Toast.LENGTH_LONG).show();
+                        }
                     }
                 });
             }
@@ -220,37 +264,68 @@ public class AppPickerActivity extends Activity {
 
     private void writeExclude() {
         final String value = joinExcluded();
-        new Thread(new Runnable() {
+        final int seq = ++writeSeq;
+        writeExec.execute(new Runnable() {
             @Override public void run() {
-                // write, then read back: a silent su failure (revoked grant,
-                // dead shell) used to leave the checkbox on-screen while the
-                // key stayed empty — re-entering showed the check "gone".
-                // Mismatch triggers one retry, then the UI reverts to the
-                // key's actual content so what you see is what is stored.
-                boolean ok = SettingsWriter.put(AppPickerActivity.this,
-                        MainHook.KEY_ROT_EXCLUDE, value);
-                HashSet<String> stored = readStoredExclude();
-                if (!stored.equals(excluded)) {
-                    RootWriter.write("settings put system "
-                            + MainHook.KEY_ROT_EXCLUDE + " " + value + "\n");
-                    stored = readStoredExclude();
-                }
-                final HashSet<String> storedF = stored;
-                runOnUiThread(new Runnable() {
-                    @Override public void run() {
-                        if (!storedF.equals(excluded)) {
-                            excluded.clear();
-                            excluded.addAll(storedF);
-                            apps.notifyDataSetChanged();
-                            updateCount();
-                            Toast.makeText(AppPickerActivity.this,
-                                    "写入未生效，请授予「修改系统设置」权限或检查 root 授权",
-                                    Toast.LENGTH_LONG).show();
-                        }
-                    }
-                });
+                verifyWrite(seq, value);
             }
-        }).start();
+        });
+    }
+
+    /** Verify one exclusion write. The root-shell path lands the key
+     *  asynchronously (su spawn + `settings` CLI startup, tens to hundreds
+     *  of ms) while this thread reads back in ~1 ms — a single immediate
+     *  read-back raced every write and reverted each toggle, so checking or
+     *  unchecking never stuck. Poll the provider until it reflects the
+     *  write, retry once (a cold `su` can stall on the superuser prompt),
+     *  and only surface a mismatch for the newest write. */
+    private void verifyWrite(int seq, String value) {
+        boolean direct = SettingsWriter.put(this, MainHook.KEY_ROT_EXCLUDE, value);
+        HashSet<String> want = parseExclude(value);
+        HashSet<String> stored = settleRead(want, direct);
+        if (stored != null && !stored.equals(want) && seq == writeSeq) {
+            SettingsWriter.put(this, MainHook.KEY_ROT_EXCLUDE, value);
+            stored = settleRead(want, false);
+        }
+        final HashSet<String> storedF = stored;
+        runOnUiThread(new Runnable() {
+            @Override public void run() {
+                // what you see is what is stored; a newer toggle decides the
+                // state on its own, so a stale verification must not revert it
+                if (storedF == null || storedF.equals(excluded) || seq != writeSeq) {
+                    return;
+                }
+                excluded.clear();
+                excluded.addAll(storedF);
+                apps.notifyDataSetChanged();
+                updateCount();
+                Toast.makeText(AppPickerActivity.this,
+                        "写入未生效，请授予「修改系统设置」权限或检查 root 授权",
+                        Toast.LENGTH_LONG).show();
+            }
+        });
+    }
+
+    /** Read back until the provider shows `want` (direct provider writes
+     *  land synchronously; shell writes need a few rounds) or retries run
+     *  out — the last read is returned either way, null on interruption. */
+    private HashSet<String> settleRead(HashSet<String> want, boolean direct) {
+        int rounds = direct ? 2 : 10;
+        HashSet<String> now = null;
+        for (int i = 0; i < rounds; i++) {
+            if (i > 0) {
+                try {
+                    Thread.sleep(60);
+                } catch (InterruptedException e) {
+                    return null;
+                }
+            }
+            now = readStoredExclude();
+            if (now.equals(want)) {
+                break;
+            }
+        }
+        return now;
     }
 
     private String joinExcluded() {
@@ -266,22 +341,28 @@ public class AppPickerActivity extends Activity {
         return sb.toString();
     }
 
-    private HashSet<String> readStoredExclude() {
+    /** Exclusion key parser shared with MainHook's readExclude: semicolon-
+     *  separated package names, blank segments dropped. */
+    private static HashSet<String> parseExclude(String raw) {
         HashSet<String> set = new HashSet<String>();
-        try {
-            String raw = Settings.System.getString(getContentResolver(),
-                    MainHook.KEY_ROT_EXCLUDE);
-            if (raw != null) {
-                for (String s : raw.split(";")) {
-                    s = s.trim();
-                    if (!s.isEmpty()) {
-                        set.add(s);
-                    }
+        if (raw != null) {
+            for (String s : raw.split(";")) {
+                s = s.trim();
+                if (!s.isEmpty()) {
+                    set.add(s);
                 }
             }
-        } catch (Throwable ignored) {
         }
         return set;
+    }
+
+    private HashSet<String> readStoredExclude() {
+        try {
+            return parseExclude(Settings.System.getString(getContentResolver(),
+                    MainHook.KEY_ROT_EXCLUDE));
+        } catch (Throwable ignored) {
+            return new HashSet<String>();
+        }
     }
 
     private static class AppItem {
