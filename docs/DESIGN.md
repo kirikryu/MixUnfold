@@ -62,6 +62,10 @@
 另有 `Application.onCreate` after 中注册的进程内广播接收器
 （`cetushome.rotationunlock.RESTART`），供控制面板触发桌面重启。
 
+第三目标进程 `system_server`：**引擎模式（E0，见第 11 节）**——点亮休眠的
+MIUI 折叠横屏引擎并桥接排除清单；第 10 节的 W1–W5 为引擎不可用时的
+回退实现（当前 ROM 已验证引擎可用，未注册）。
+
 另一目标进程 `com.android.systemui`（锁屏旋转解锁，根因与风险见第 9 节）：
 
 | # | 目标 | 方式 | 效果 |
@@ -209,3 +213,137 @@ SystemUI 进程内读取一次，关闭开关后重启 SystemUI
 `dumpsys window windows | grep -A3 'u0 NotificationShade}' | grep or=`
 应为 USER、`dumpsys window | grep mRotation=` 可到 1；折叠态外屏锁屏
 必须仍为 PORTRAIT（无条件回归项）；解锁后旋转与改造前一致。
+
+## 10. 内屏全局旋转的根因与 system_server 钩子（W1/W2/W3）
+
+适配 HyperOS V816.0.8.0.TJTCNXM（Android 13）。cetus 上 MIUI 折叠屏横屏
+适配引擎整体未启用：`ro.config.miui_orientation_enable` 未设置，引擎所有
+调用链被 `MiuiOrientationStub.isEnabled()` 门控（`ActivityRecord.setOrientation`
+的 MIUI 补丁 services.jar ~7094-7126 三重 guard 提前 return），实测为死代码。
+应用各按 manifest 方向声明运行。因此不 hook 引擎写点，而在活跃写点
+（W1 登记+中和）与两个**活跃读取点**施加等效改写（效果等同引擎
+FULL_LANDSCAPE 分支：显示跟随自动旋转与控制中心旋转锁）：
+
+| # | 目标 | 方式 | 效果 |
+|---|---|---|---|
+| W1 | `ActivityRecord.setOrientation(int, WindowContainer)` | before | 登记 + 请求中和：requested ∉ {-1,-2,3}、非相机包、且 `firstWindowDrawn==false`（构造期请求，此时 `mActivityComponent` 已赋值，取包名安全）→ 记入弱表（value = 登记时原请求，供恢复）；随后 d–g 门控全部满足时把请求参数与 `info.screenOrientation` 同时改写为 -1（等同引擎 FULL_LANDSCAPE case-1 的双写：启动预览窗按 `info` 渲染，漏写 `info` 会先闪一帧竖屏预览）；门控不满足则保留原请求、仅登记（由 W2/W3 在读点继续守护）。2 参覆写是 ActivityRecord 上唯一声明的 setOrientation（ctor 单参调用 ~1844 行经 `WindowContainer.setOrientation(int)` 虚派发必经此处） |
+| W2 | `ActivityRecord.getOrientation(int)` | after | 命中成员改写为 `SCREEN_ORIENTATION_UNSPECIFIED(-1)`。**必须 hook 覆写本身**：本 ROM 的 ActivityRecord 覆写该方法且不调 super（~7206 行，内含投屏/嵌入干预分支），hook WindowContainer 基类版本实测零触发 |
+| W3 | `WindowContainer.getRequestedConfigurationOrientation(boolean)` | after | `args[0]==true` 为 display 级变体，直接 return（永不涉及 activity）；`ActivityRecord.isInstance` 限定（ActivityRecord 未覆写该方法，已核实）；命中成员改写为 `Configuration.ORIENTATION_UNDEFINED(0)`。漏掉此点会出现"显示已横、窗口仍竖"的错位渲染 |
+| W4 | `DisplayRotation.rotationForOrientation(int, int)` | before | 合盖强制竖屏：折叠时把默认显示的旋转决策钉死为 `ROTATION_0`（仅 `isDefaultDisplay` + `mPolicy.isDisplayFolded()`，总开关管辖）；**显式横屏请求（LANDSCAPE/SENSOR_LANDSCAPE/REVERSE_LANDSCAPE，即视频全屏类）放行**，外屏全屏视频保留原厂横屏能力。ROM 自身"外屏锁竖屏"配置对（`mUserRotationModeOuter`）从不被应用（全部更新路径被 `isEnabled()` 门控，实机 `mUserRotationMode=USER_ROTATION_FREE`），全局自动旋转常开时自由旋转类应用在原厂也会把外屏转横——W4 兑现"内屏自由、外屏锁定"（机主要求，超出原厂的显式模块行为） |
+| W5 | `ActivityRecord.isSnapshotCompatible(TaskSnapshot)` | after | 功能开启时（d/c/e/f/g 门控通过）对快照启动窗一律返回 false：任务快照窗渲染磁盘缓存的截图位图，与 `info`/`mOrientation` 无关、也不要求应用已登记（原生 UNSPECIFIED 的拨号/时钟/日历从不进弱表）——竖屏持久化快照会在旋转跟随窗口前闪一帧竖屏；快照窗被跳过后回落 splash（已随 W1 的 info 中和跟随）。曾尝试"快照 rotation 与显示 rotation 不一致才跳过"的精细化判定，实机失效（启动窗决策时记录尚无可靠显示挂载），已回退为无条件跳过。TaskSnapshot 参数类在本 ROM 类加载器不可解析（ClassNotFoundError 实测），故按方法名 `hookAllMethods` 挂钩 |
+
+**W2/W3 改写前提**（全部满足才改写；W2 实际顺序 b→d→e→a→c→f→g，与
+原始 a→b→c→d→e→f→g 的偏差是**恢复可达性**要求所致：d/e 兼作恢复门，
+而被中和记录的当前值恰为 -1，谓词 a 会先行 bail——d/e 若在 a 之后，
+总开关关闭与排除清单的即时还原永远不可达，实机表现为"清理后台才生效"。
+改写路径内 c 之后保持原顺序）：
+
+b) 成员在弱表（弱表为空整链快速 bail——W2 是递归热路径）；
+d) 总开关开启（否则还原已中和记录并返回）；
+e) 包名不在用户排除清单（否则还原并返回）；
+a) requested/当前值通过目标谓词 ∉ {-1,-2,3}。W3 里映射为配置空间等价形式：
+   结果 ∈ {ORIENTATION_PORTRAIT(1), ORIENTATION_LANDSCAPE(2)}（UNDEFINED 即穿透）；
+c) 不在内置相机名单 `HashSet.contains`；
+f) **折叠门（硬保障）**：先查 ROM 自身全局折叠态
+   `mPolicy.isDisplayFolded()`（与 MIUI 补丁同源的
+   `mAtmService.mWindowManager.mPolicy.isDisplayFolded()` 反射调用，关闭
+   折叠切换期 reparent 记录合并配置滞后的竞态窗口），再按 ActivityRecord
+   实时合并配置的 `smallestScreenWidthDp` 判定（实机：内屏 676dp、外屏
+   320dp，阈值 600——与桌面侧钩子同一判别式；低于任务书参考值 654/393，
+   对阈值更宽容）。每次求值实时反射判定，任何异常或无法求值一律闭合为
+   "折叠"→ 不改写，保证折叠态外屏永不触碰；
+g) 非多窗口、非 MIUI 尺寸兼容——**例外：MIUI 平行窗口（嵌入）记录跟随
+   旋转**（`inMultiWindowMode()` 为真时放行 `mMiuiEmbeddingEnabled`==true
+   的记录，构造期 final 字段 ~340/~1826 按包启用；分屏/小窗/PIP 等其余
+   多窗口保持原厂）。本 ROM 实际 API（均已反编译核实）：
+   `ConfigurationContainer.inMultiWindowMode()`（继承，~253）、
+   `ActivityRecord.inMiuiSizeCompatMode()`（~7178，MIUI 专有）。任一调用
+   失败或 API 缺失一律闭合为"不允许改写"。原 `isEmbedded()` 检查已撤销：
+   早前记录的"嵌入包解锁导致 MIUI 嵌入扩展崩溃（微博 → MiuiSplitController
+   Invalid Task id）"经机主更正，实为第三方旋转模块（完美横屏应用计划，
+   Magisk 模块）配置冲突所致，非嵌入解锁本身；如复现异常可重新收紧。
+
+**弱表 key 选择**：ActivityRecord 实例本身（`WeakHashMap` +
+`Collections.synchronizedMap`，求值在 WMS 锁下多线程进行）。W1 登记与
+W2/W3 查询取的是同一引用（各自的 `param.thisObject`），零反射；IBinder
+token 方案需在两侧各加一次反射取 token，无收益。
+
+**配置**（两项，`Settings.System`，system_server 内 ContentObserver 缓存，
+切换即时生效无需重启）：
+
+- 总开关 `cetus_free_rot`：1=开（默认）。关闭后即使成员在弱表中也全部
+  不改写（全机恢复原厂）。
+- 排除清单 `cetus_free_rot_exclude`：分号分隔包名。语义只有一种：清单内
+  的应用不旋转（维持原厂方向行为），其余全部跟随旋转。
+
+懒加载红线：`handleLoadPackage("android")` 时 SettingsProvider 未就绪，
+首次 hook 调用（`freeRotOn()`）才读配置；读取失败保持未加载态、下次调用
+重试（期间取默认值：功能开、无排除）。Observer 注册失败仅损失即时性，
+不损失正确性。
+
+**内置相机名单**（代码常量，不可配置，任何状态排除；成像方向依赖传感器，
+永远不动）：`com.android.camera`、`com.android.cameraextensions`、
+`com.xiaomi.cameratools`（2026-10-31 实机 `pm list packages | grep -iE
+'camera'` 核实）。
+
+**已知偏差（设计代价，非 bug）**：弱表内成员运行期的
+`setRequestedOrientation`（播放器点全屏、游戏切横屏）会被吸收为"跟随
+旋转"，用户转回手持方向即可——"所有应用自由旋转"的固有代价；**未登记**
+活动（构造后 `firstWindowDrawn==true` 才首次发出锁定请求的极少数路径）
+的运行期请求保持原样。两条表述的区别：已登记 = 构造期请求进入过弱表，
+此后其运行期方向请求全部被吸收；未登记 = 构造期从未发出过锁定请求，
+其后续行为完全原厂。**外屏合盖强制竖屏（W4）**为模块行为而非原厂行为：
+原厂在全局自动旋转开启时自由旋转类应用合盖后仍会转横（外屏锁定机制在
+cetus 上是死代码，实机确认）；本模块按机主要求合盖钉死竖屏，关闭总开关
+即回到原厂行为。
+
+**LSPosed 注入注意（system_server 特有）**：lspd 对 system_server 的注入
+发生在 PackageManager 就绪之前，模块 APK 路径取自其 `modules_config.db`。
+覆盖安装若换了 `/data/app` 路径而 LSPosedService 未及刷新（其刷新例程
+恰是开机扫描，路径失效即死循环），system_server 将静默不注入（app 进程
+不受影响，lspd 会经 PM 重新解析）。现象：`logcat` 出现
+`LSPosedService: Failure to parse package archive ... No such file or
+directory`。处置：趁系统运行重新 `pm install -r` 一次（触发
+PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed 中存储为
+`system` 包名行，重装模块后需机主在管理器中重新确认。
+
+**验收**：内屏展开后锁竖屏（设置/浏览器）与锁横屏（游戏/播放器）应用都
+跟随物理旋转，`dumpsys window | grep 'mRotation='` 跟随变化；排除/开关
+变更 `logcat` 中 `free-rot config reloaded` 逐一命中、无需重启；合盖后
+所有应用竖屏 `mRotation=0`（无条件回归项）。
+
+## 11. 引擎模式（E0）：点亮原生折叠横屏引擎
+
+机主提出"移除全部 cetus 限制、与后面几代一视同仁"后，逆向确认该路线
+成立并已实施，W1–W5（第 10 节）整体退役为回退实现：
+
+- **引擎本体**：`com.android.server.wm.MiuiOrientationImpl`
+  （miui-services.jar，`MiuiStubUtil` 单例，反编译确认实例即该类）。
+  `isEnabled() = ENABLED(prop ro.config.miui_orientation_enable，cetus
+  未设) && MIUI 优化 && 智能旋转设置` → cetus 上恒 false；但
+  `IS_FOLD = persist.sys.muiltdisplay_type==2` 实机为 **true**，引擎完整
+  可用。E0 = hook `isEnabled()` 前置返回总开关状态（`cetus_free_rot`，
+  懒加载 + ContentObserver 与第 10 节同源）。
+- **点亮后的原生能力**（全部是手搓 W1–W5 试图复刻的）：写点中和
+  （`info.screenOrientation=-1` + `super(-1)`，启动窗构造性一致，闪帧/
+  颓顿问题簇不存在）；内外屏旋转设置原生分离
+  （`accelerometer_rotation_outer/inner`、`user_rotation_outer/inner`，
+  折叠切换时经 `setUserRotation` 应用，外屏默认 LOCKED 竖屏、显式横屏
+  （视频全屏）放行——第 10 节 W4 的语义原生成立）；嵌入记录引擎原生
+  豁免（`isEmbedded(r)` → stock）；相机有专属策略
+  （`FullScreen3AppCameraStrategy`）。
+- **允许表桥接**：引擎内屏解锁是**按包允许表**（system/user 两级 map，
+  cetus 系统表为空 → 不桥接则全 stock）。模块在首次 isEnabled 调用与
+  排除清单变更时重建用户表：**全部已装应用 − 用户排除 − 相机 −
+  桌面（com.miui.home，保留桌面侧自有钩子）**，值 `nr`（FULL_LANDSCAPE
+  使能位），经 `clearUserSettings + setUserSettings` 全量重建，引擎持久
+  化到自身设置文件。同步在配置线程执行（避免 WMS 锁内做 PM 查询）。
+- **总开关语义**：关 → `isEnabled()` 恢复 false → 引擎休眠、全机原厂
+  （允许表文件残留但引擎不读，无行为影响）。
+- **已知限制**：新安装应用在下次允许表同步（重启或排除变更）前不跟随
+  内屏旋转——后续可监听 PACKAGE_ADDED 增量同步；外屏 LOCKED 对在折叠
+  事件时应用，开机即折叠的场景需一次折叠循环生效。
+- **侦察记录**：`MiuiStubUtil` 与引擎策略不在 services.jar（在
+  miui-services.jar / miui-framework），`TaskSnapshot` 类在 system_server
+  类加载器不可解析（W5 按名挂钩的原因）；引擎模式下 `systemContext()`
+  必须用 lpp.classLoader（`actRecCls` 未解析，曾致 NPE 静默断链）。

@@ -1,9 +1,24 @@
 package cetushome.hook;
 
+import android.content.ComponentName;
 import android.content.Context;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.database.ContentObserver;
+import android.net.Uri;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.WeakHashMap;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XC_MethodReplacement;
@@ -59,10 +74,24 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *     untouched, and the unlocked path (UNSPECIFIED) is never modified.
  *     Governed by the "锁屏允许横屏" switch (cetus_home_lockscreen_rot).
  *
+ * A third target is system_server (LSPosed scope 系统框架/"android"):
+ * W1/W2/W3 inner-screen free rotation (see hookSystemServer). MIUI's fold
+ * orientation engine ships in services.jar but is disabled on cetus
+ * (ro.config.miui_orientation_enable unset — every call site is gated by
+ * MiuiOrientationStub.isEnabled(), verified dead), so apps run on their
+ * manifest orientation. Rather than that dead write point, the two live
+ * read points are rewritten to the engine's effective output:
+ * UNSPECIFIED (orientation preference) and ORIENTATION_UNDEFINED
+ * (configuration orientation). The unfolded inner display then follows
+ * auto-rotate for every registered app; the folded cover screen is never
+ * touched (live per-record fold gate, failures closed to "no rewrite").
+ *
  * Settings are read ONCE per process into a static cache and refreshed by
  * restarting the process (launcher from the module UI; SystemUI via
- * `pkill -f com.android.systemui`) — hook bodies must stay cheap because
- * getCellCountX sits on hot layout paths.
+ * `pkill -f com.android.systemui`). The system_server side instead watches
+ * its two keys with a ContentObserver — switch and exclusion list apply
+ * immediately, no restart. Hook bodies must stay cheap because getCellCountX
+ * and getOrientation sit on hot layout paths.
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -74,6 +103,8 @@ public class MainHook implements IXposedHookLoadPackage {
     public static final String KEY_LAND_PAGES = "cetus_home_land_pages";
     public static final String KEY_PAD_OPT = "cetus_home_pad_opt";
     public static final String KEY_LOCK_ROT = "cetus_home_lockscreen_rot";
+    public static final String KEY_FREE_ROT = "cetus_free_rot";
+    public static final String KEY_ROT_EXCLUDE = "cetus_free_rot_exclude";
 
     private static Class<?> dcCls;
     private static Class<?> appCls;
@@ -316,6 +347,10 @@ public class MainHook implements IXposedHookLoadPackage {
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
+        if ("android".equals(lpp.packageName)) {
+            hookSystemServer(lpp);
+            return;
+        }
         if ("com.android.systemui".equals(lpp.packageName)) {
             hookSystemUI(lpp);
             return;
@@ -941,6 +976,765 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             log("hook S1 FAILED: " + t);
         }
+    }
+
+    // ================== system_server: inner-screen free rotation ============
+
+    /** Stock camera apps, excluded in every state and never configurable —
+     *  imaging direction follows the sensor (2026-10-31 `pm list packages`
+     *  verified set). Embedded-config packages stay excluded too: unlocking
+     *  them crashed MIUI's embedding extension on the landscape inner screen
+     *  (Weibo -> MiuiSplitController "Invalid Task id"); the record-level
+     *  isEmbedded() gate below keeps that lesson enforced. */
+    private static final HashSet<String> CAMERA_PKGS = new HashSet<String>(Arrays.asList(
+            "com.android.camera", "com.android.cameraextensions", "com.xiaomi.cameratools"));
+
+    /**
+     * Weak registry of activities whose locked orientation may be rewritten.
+     * Key: the ActivityRecord instance itself — W1 registers param.thisObject
+     * and W2/W3 query the very same reference, so lookups need no reflective
+     * field reads; a token (IBinder) key would add one on each side with no
+     * benefit. Synchronized wrapper: orientation evaluation runs under WMS
+     * locks from several threads. Value: the stock requested orientation at
+     * registration time — the source for restoring stock behavior when the
+     * master switch goes off or the package is excluded.
+     */
+    private static final Map<Object, Integer> ROT_REG =
+            Collections.synchronizedMap(new WeakHashMap<Object, Integer>());
+
+    private static Class<?> actRecCls;
+    private static Class<?> wcCls;
+    private static Context sysCtx;
+    private static HandlerThread cfgThread;
+    private static Handler cfgHandler;
+    private static volatile boolean sysCfgReady;
+    private static volatile boolean cfgFreeRot = true;
+    private static volatile HashSet<String> cfgExclude = new HashSet<String>();
+
+    /** Rewrite logging capped per package — W2 sits on a recursive hot path
+     *  and must not flood logcat during rotation. */
+    private static final HashMap<String, Integer> REWRITE_LOGGED = new HashMap<String, Integer>();
+
+    /** W4 state: whether the folded cover pin is currently applied (for
+     *  transition logging only). */
+    private static volatile boolean w4FoldedPinned;
+
+    // ==================== engine mode ========================================
+    //
+    // The owner asked to "remove all cetus restrictions and treat the device
+    // like later folds". The full MIUI fold orientation engine ships in
+    // miui-services.jar (MiuiOrientationImpl) but is dormant: isEnabled()
+    // = prop && MIUI-optimization && smart-rotation setting, all false on
+    // cetus. IS_FOLD however is true (persist.sys.muiltdisplay_type=2) and
+    // the impl is complete. Lighting it up replaces W1-W5 wholesale:
+    //  - write-time request neutralization (info.screenOrientation=-1 +
+    //    super(-1)) — starting windows are consistent by construction, the
+    //    whole flash/pause cluster dissolves;
+    //  - native per-display rotation-lock separation: outer pair LOCKED/
+    //    portrait (free-rotating apps stay portrait on the cover), explicit
+    //    landscape (video fullscreen) still rotates, inner screen free;
+    //  - embedded/parallel-window records exempted natively (stock);
+    //  - per-package allowlist persisted to a settings file.
+    // The engine's inner unlock is allowlist-based, so this module bridges
+    // its exclusion semantics onto it: user settings = all installed
+    // packages - user exclusions - camera - launcher (the launcher keeps
+    // its own rotation hooks). W1-W5 stay in the source as a fallback for
+    // ROMs without the impl class but are not registered in engine mode. */
+    private static volatile boolean engineSynced;
+    private static final HashSet<String> engineSyncedExclude = new HashSet<String>();
+    private static final Object ENGINE_SYNC_LOCK = new Object();
+    private static boolean engineMode;
+    private static volatile boolean engineDiagLogged;
+    private static volatile boolean engineFirstCallLogged;
+    /** system_server classloader captured in engine mode — the legacy
+     *  actRecCls resolution never runs there, and systemContext() needs a
+     *  loader that can see android.app.ActivityThread. */
+    private static ClassLoader sysLoader;
+
+    /** Engine mode: light up the dormant MIUI fold orientation engine and
+     *  bridge the exclusion list onto its per-package allowlist. Returns
+     *  false when the impl class is unavailable (legacy W1-W5 then apply). */
+    private static boolean hookEngineMode(XC_LoadPackage.LoadPackageParam lpp) {
+        final Class<?> implCls;
+        try {
+            implCls = XposedHelpers.findClass(
+                    "com.android.server.wm.MiuiOrientationImpl", lpp.classLoader);
+            sysLoader = lpp.classLoader;
+        } catch (Throwable t) {
+            log("engine mode unavailable: " + t);
+            return false;
+        }
+        try {
+            // diagnostic: which class does MiuiStubUtil actually serve for
+            // the stub? A device-specific subclass would dodge the method
+            // hook below.
+            final Class<?> stubCls = XposedHelpers.findClass(
+                    "com.android.server.wm.MiuiOrientationStub", lpp.classLoader);
+            XposedBridge.hookAllMethods(stubCls, "get", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    if (param.getResult() != null && !engineDiagLogged) {
+                        engineDiagLogged = true;
+                        log("E0 diag: stub impl class = "
+                                + param.getResult().getClass().getName());
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            log("E0 diag hook failed: " + t);
+        }
+        try {
+            XposedBridge.hookAllMethods(implCls, "isEnabled", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                    try {
+                        if (!engineFirstCallLogged) {
+                            engineFirstCallLogged = true;
+                            log("E0 first isEnabled invocation");
+                        }
+                        if (!freeRotOn()) {
+                            return; // switch off: engine dormant, stock everywhere
+                        }
+                        param.setResult(true);
+                        Object impl = param.thisObject;
+                        boolean dirty;
+                        synchronized (ENGINE_SYNC_LOCK) {
+                            dirty = !engineSynced || !engineSyncedExclude.equals(cfgExclude);
+                        }
+                        if (dirty) {
+                            scheduleEngineAllowlistSync(impl);
+                        }
+                    } catch (Throwable t) {
+                        log("E0 failed: " + t);
+                    }
+                }
+            });
+            log("hook E0 ok: MiuiOrientationImpl.isEnabled (engine mode)");
+            return true;
+        } catch (Throwable t) {
+            log("hook E0 FAILED: " + t);
+            return false;
+        }
+    }
+
+    private static void scheduleEngineAllowlistSync(final Object impl) {
+        Handler h = cfgHandler;
+        if (h == null) {
+            return; // config thread not up yet — the next isEnabled retries
+        }
+        h.post(new Runnable() {
+            @Override public void run() {
+                syncEngineAllowlist(impl);
+            }
+        });
+    }
+
+    /** Rebuild the engine's user allowlist = all installed packages minus
+     *  user exclusions, camera and the launcher (the launcher keeps its own
+     *  rotation hooks; camera apps keep stock via the engine's own camera
+     *  strategy). "nr" carries the FULL_LANDSCAPE enable bit; the engine
+     *  persists the map to its settings file. Runs off the WMS locks. */
+    private static void syncEngineAllowlist(Object impl) {
+        synchronized (ENGINE_SYNC_LOCK) {
+            if (engineSynced && engineSyncedExclude.equals(cfgExclude)) {
+                return;
+            }
+        }
+        try {
+            Context ctx = sysCtx;
+            PackageManager pm = ctx.getPackageManager();
+            ArrayList<String> allow = new ArrayList<String>();
+            for (PackageInfo pi : pm.getInstalledPackages(0)) {
+                if (pi == null || pi.packageName == null) {
+                    continue;
+                }
+                String pkg = pi.packageName;
+                if (pkg.equals("com.miui.home")
+                        || CAMERA_PKGS.contains(pkg)
+                        || cfgExclude.contains(pkg)) {
+                    continue;
+                }
+                allow.add(pkg);
+            }
+            java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.StringWriter());
+            Object manager = XposedHelpers.callMethod(impl, "getPackageManager");
+            XposedHelpers.callMethod(manager, "clearUserSettings");
+            XposedHelpers.callMethod(impl, "setUserSettings", pw,
+                    allow.toArray(new String[0]), "nr");
+            synchronized (ENGINE_SYNC_LOCK) {
+                engineSyncedExclude.clear();
+                engineSyncedExclude.addAll(cfgExclude);
+                engineSynced = true;
+            }
+            log("engine allowlist synced: " + allow.size() + " packages, excluded "
+                    + cfgExclude.size());
+        } catch (Throwable t) {
+            log("engine allowlist sync failed: " + t);
+        }
+    }
+
+    /**
+     * W1/W2(/W3) — make every registered app follow rotation on the unfolded
+     * inner display. Gate order below is part of the spec (cheapest first):
+     *  a) requested/current ∉ {UNSPECIFIED(-1), UNSET(-2), BEHIND(3)} — the
+     *     first two already follow or are invisible; BEHIND propagates
+     *     "inherit the next activity" (WindowContainer aggregate walk) and
+     *     must stay coupled to its host, e.g. dialog activities;
+     *  b) member of ROT_REG (empty registry bails the whole W2 hot path);
+     *  c) not a stock camera package (before any config dependency — holds
+     *     even before the settings provider is up);
+     *  d) master switch cetus_free_rot on;
+     *  e) package not on the user exclusion list cetus_free_rot_exclude
+     *     (semicolon-separated; only semantic: apps on the list keep stock
+     *     orientation, all others follow);
+     *  f) record lives on the unfolded inner display — live
+     *     smallestScreenWidthDp >= 600 per evaluation; any failure closes to
+     *     "no rewrite". Hard guarantee that the folded cover screen keeps
+     *     stock behavior;
+     *  g) not embedded/parallel-window, not multi-window, not MIUI
+     *     size-compat (isEmbedded / inMultiWindowMode /
+     *     inMiuiSizeCompatMode — all three verified in this ROM; a missing
+     *     API closes to "no rewrite").
+     */
+    private static void hookSystemServer(XC_LoadPackage.LoadPackageParam lpp) {
+        if (hookEngineMode(lpp)) {
+            log("system_server: ENGINE MODE active (W1-W5 superseded, not registered)");
+            return;
+        }
+        // ---- legacy W1-W5 below: fallback for ROMs without the impl class ----
+        try {
+            actRecCls = XposedHelpers.findClass(
+                    "com.android.server.wm.ActivityRecord", lpp.classLoader);
+            wcCls = XposedHelpers.findClass(
+                    "com.android.server.wm.WindowContainer", lpp.classLoader);
+        } catch (Throwable t) {
+            log("system_server class resolve FAILED: " + t);
+            return;
+        }
+        log("attached to system_server");
+
+        // W1. registration only — no stock field is ever written. The
+        // 2-arg override is the only setOrientation declared on
+        // ActivityRecord: the constructor's single-arg call funnels here
+        // through WindowContainer's virtual dispatch, as does every
+        // setRequestedOrientation path that is not intercepted by a MIUI
+        // stub (those paths belong to embedded/freeform — excluded by g).
+        try {
+            XposedHelpers.findAndHookMethod(actRecCls, "setOrientation",
+                    int.class, wcCls, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                int req = (Integer) param.args[0];
+                                if (req == -1 || req == -2 || req == 3) {
+                                    return;
+                                }
+                                if (XposedHelpers.getBooleanField(
+                                        param.thisObject, "firstWindowDrawn")) {
+                                    return; // construction-time requests only
+                                }
+                                String pkg = pkgOf(param.thisObject);
+                                if (pkg == null || CAMERA_PKGS.contains(pkg)) {
+                                    return;
+                                }
+                                ROT_REG.put(param.thisObject, req);
+                                log("W1 registered: " + pkg);
+                                // Neutralize the request itself — the
+                                // disabled engine's FULL_LANDSCAPE case-1
+                                // does exactly this (info.screenOrientation
+                                // = -1 + super(-1)): the starting window
+                                // (rendered from info) and the first layout
+                                // then already follow rotation — no one-
+                                // frame portrait flash. All gates must pass,
+                                // otherwise the stock request stands and
+                                // W2/W3 keep guarding the read points.
+                                if (!freeRotOn()) {
+                                    return; // d
+                                }
+                                if (cfgExclude.contains(pkg)) {
+                                    return; // e
+                                }
+                                if (folded(param.thisObject)) {
+                                    return; // f
+                                }
+                                if (!windowingAllowed(param.thisObject)) {
+                                    return; // g
+                                }
+                                param.args[0] = -1;
+                                setInfoOrientation(param.thisObject, -1);
+                                logRewrite("W1", pkg);
+                            } catch (Throwable t) {
+                                log("W1 failed: " + t);
+                            }
+                        }
+                    });
+            log("hook W1 ok: ActivityRecord.setOrientation");
+        } catch (Throwable t) {
+            log("hook W1 FAILED: " + t);
+        }
+
+        // W2. the orientation preference read point. This ROM overrides
+        // getOrientation(int) on ActivityRecord without calling super
+        // (services.jar ~7206) — the WindowContainer base version never
+        // fires for activities, hooking it was verified to be zero-trigger.
+        // Result rewrite to UNSPECIFIED equals the disabled engine's
+        // FULL_LANDSCAPE branch: the display follows auto-rotate and the
+        // control-center rotation lock.
+        try {
+            XposedHelpers.findAndHookMethod(actRecCls, "getOrientation",
+                    int.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                if (ROT_REG.isEmpty() || !ROT_REG.containsKey(param.thisObject)) {
+                                    return; // b (fast bail on the hot path)
+                                }
+                                String pkg = pkgOf(param.thisObject);
+                                if (pkg == null) {
+                                    return;
+                                }
+                                // d/e double as the restore gate and MUST run
+                                // before predicate (a): a neutralized record
+                                // stores -1, which (a) bails on — restore
+                                // would be unreachable for exactly the
+                                // records that need it (observed: exclusion
+                                // and switch-off only applied after the app
+                                // was killed from recents)
+                                if (!freeRotOn()) {
+                                    restoreStockOrientation(param.thisObject); // d
+                                    return;
+                                }
+                                if (cfgExclude.contains(pkg)) {
+                                    restoreStockOrientation(param.thisObject); // e
+                                    return;
+                                }
+                                int cur = (Integer) param.getResult();
+                                if (cur == -1 || cur == -2 || cur == 3) {
+                                    return; // a: already follow / unset / behind
+                                }
+                                if (CAMERA_PKGS.contains(pkg)) {
+                                    return; // c
+                                }
+                                if (folded(param.thisObject)) {
+                                    return; // f
+                                }
+                                if (!windowingAllowed(param.thisObject)) {
+                                    return; // g
+                                }
+                                param.setResult(-1); // SCREEN_ORIENTATION_UNSPECIFIED
+                                logRewrite("W2", pkg);
+                            } catch (Throwable t) {
+                                // any failure keeps the stock result
+                            }
+                        }
+                    });
+            log("hook W2 ok: ActivityRecord.getOrientation");
+        } catch (Throwable t) {
+            log("hook W2 FAILED: " + t);
+        }
+
+        // W3 — stage 2: configuration-orientation read point. W1+W2 passed
+        // on-device verification (acceptance 1 & 4 gates hold: rewrites only
+        // on the unfolded inner display, sw676dp inner / sw320dp cover).
+        hookW3();
+
+        // W4 — the owner-requested per-display lock ("内外屏分别锁定旋转").
+        // The ROM's own outer-portrait pair (mUserRotationModeOuter) is never
+        // applied on cetus — every update path is gated by the disabled
+        // engine — so with global auto-rotate on, freely-rotating apps turn
+        // the folded cover landscape (stock behavior, confirmed on device).
+        // That breaks the feature's outer-screen guarantee, so while folded
+        // the default display's rotation decision is pinned to ROTATION_0.
+        // Master-switch governed; the unfolded inner display is untouched.
+        try {
+            final Class<?> dispRotCls = XposedHelpers.findClass(
+                    "com.android.server.wm.DisplayRotation", lpp.classLoader);
+            XposedHelpers.findAndHookMethod(dispRotCls, "rotationForOrientation",
+                    int.class, int.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                if (!XposedHelpers.getBooleanField(
+                                        param.thisObject, "isDefaultDisplay")) {
+                                    return;
+                                }
+                                if (!freeRotOn()) {
+                                    return; // switch off: stock everywhere
+                                }
+                                Object policy = XposedHelpers.getObjectField(
+                                        XposedHelpers.getObjectField(
+                                                param.thisObject, "mService"),
+                                        "mPolicy");
+                                if ((Boolean) XposedHelpers.callMethod(
+                                        policy, "isDisplayFolded")) {
+                                    int orient = (Integer) param.args[0];
+                                    // explicit landscape requests (video
+                                    // fullscreen: LANDSCAPE / SENSOR_LANDSCAPE
+                                    // / REVERSE_LANDSCAPE) pass through so
+                                    // cover-screen video keeps stock rotation;
+                                    // everything else pins to portrait
+                                    boolean explicitLandscape =
+                                            orient == 0 || orient == 6 || orient == 8;
+                                    if (!explicitLandscape) {
+                                        if (!w4FoldedPinned) {
+                                            w4FoldedPinned = true;
+                                            log("W4: folded -> default display pinned ROTATION_0"
+                                                    + " (orientation=" + orient + ")");
+                                        }
+                                        param.setResult(0); // ROTATION_0
+                                    } else if (w4FoldedPinned) {
+                                        w4FoldedPinned = false;
+                                        log("W4: folded explicit landscape -> rotation released");
+                                    }
+                                } else if (w4FoldedPinned) {
+                                    w4FoldedPinned = false;
+                                    log("W4: unfolded -> rotation released");
+                                }
+                            } catch (Throwable t) {
+                                // any failure keeps the stock decision
+                            }
+                        }
+                    });
+            log("hook W4 ok: DisplayRotation.rotationForOrientation (cover lock)");
+        } catch (Throwable t) {
+            log("hook W4 FAILED: " + t);
+        }
+
+        // W5. snapshot starting windows render the task's cached screenshot —
+        // a persisted portrait snapshot (apps used on the cover) flashes one
+        // portrait frame before the rotation-following window replaces it,
+        // regardless of W1's info neutralization (the snapshot content is a
+        // bitmap, not an orientation value) and regardless of registration
+        // (natively-UNSPECIFIED apps like dialer/clock/calendar never enter
+        // the registry). Gate: skip only snapshots whose rotation disagrees
+        // with the record's display right now — matched previews stay.
+        try {
+            // hookAllMethods: the TaskSnapshot param class is not resolvable
+            // from the system_server classloader in this ROM (verified:
+            // ClassNotFoundError), and hooking by name avoids the coupling
+            XposedBridge.hookAllMethods(actRecCls, "isSnapshotCompatible",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                if (!freeRotOn()) {
+                                    return; // d
+                                }
+                                String pkg = pkgOf(param.thisObject);
+                                if (pkg == null || CAMERA_PKGS.contains(pkg)
+                                        || cfgExclude.contains(pkg)) {
+                                    return; // c/e
+                                }
+                                if (folded(param.thisObject)) {
+                                    return; // f
+                                }
+                                if (!windowingAllowed(param.thisObject)) {
+                                    return; // g
+                                }
+                                // unconditional skip while the feature is on:
+                                // the earlier rotation-mismatch variant never
+                                // fired (the record has no reliable display
+                                // attachment at starting-window decision
+                                // time), which silently re-broke settings
+                                param.setResult(false);
+                            } catch (Throwable t) {
+                                // stock decision on any failure
+                            }
+                        }
+                    });
+            log("hook W5 ok: isSnapshotCompatible (skip rotation-mismatched snapshots)");
+        } catch (Throwable t) {
+            log("hook W5 FAILED: " + t);
+        }
+    }
+
+    /** W3. WindowContainer.getRequestedConfigurationOrientation(boolean)
+     *  after: ActivityRecord does not override it (verified), so this is
+     *  the dispatched implementation for activity records too. args[0]
+     *  true is the display-level variant — never involves an activity.
+     *  The stock result maps mOrientation to PORTRAIT/LANDSCAPE only when
+     *  a fixed orientation is requested, which is exactly predicate (a)
+     *  mapped into configuration space (UNDEFINED results pass through).
+     *  Registered members are rewritten to ORIENTATION_UNDEFINED — skipping
+     *  this point leaves "display already rotated, window still portrait"
+     *  rendering mismatch. */
+    private static void hookW3() {
+        try {
+            XposedHelpers.findAndHookMethod(wcCls, "getRequestedConfigurationOrientation",
+                    boolean.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                if (!actRecCls.isInstance(param.thisObject)) {
+                                    return;
+                                }
+                                if (Boolean.TRUE.equals(param.args[0])) {
+                                    return; // display-level variant
+                                }
+                                if (ROT_REG.isEmpty() || !ROT_REG.containsKey(param.thisObject)) {
+                                    return; // b
+                                }
+                                String pkg = pkgOf(param.thisObject);
+                                if (pkg == null) {
+                                    return;
+                                }
+                                // d/e before predicate (a) — same restore
+                                // reachability reason as W2
+                                if (!freeRotOn()) {
+                                    restoreStockOrientation(param.thisObject); // d
+                                    return;
+                                }
+                                if (cfgExclude.contains(pkg)) {
+                                    restoreStockOrientation(param.thisObject); // e
+                                    return;
+                                }
+                                int cur = (Integer) param.getResult();
+                                if (cur != 1 && cur != 2) {
+                                    return; // a mapped: ORIENTATION_PORTRAIT/LANDSCAPE only
+                                }
+                                if (CAMERA_PKGS.contains(pkg)) {
+                                    return; // c
+                                }
+                                if (folded(param.thisObject)) {
+                                    return; // f
+                                }
+                                if (!windowingAllowed(param.thisObject)) {
+                                    return; // g
+                                }
+                                param.setResult(0); // Configuration.ORIENTATION_UNDEFINED
+                                logRewrite("W3", pkg);
+                            } catch (Throwable t) {
+                                // any failure keeps the stock result
+                            }
+                        }
+                    });
+            log("hook W3 ok: WindowContainer.getRequestedConfigurationOrientation");
+        } catch (Throwable t) {
+            log("hook W3 FAILED: " + t);
+        }
+    }
+
+    /** Package name of an ActivityRecord: mActivityComponent is assigned
+     *  during construction, before any setOrientation can run; the
+     *  packageName field is the fallback. */
+    private static String pkgOf(Object r) {
+        try {
+            Object cn = XposedHelpers.getObjectField(r, "mActivityComponent");
+            if (cn != null) {
+                return ((ComponentName) cn).getPackageName();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            return (String) XposedHelpers.getObjectField(r, "packageName");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Master switch (d) with the lazy-config red line: at
+     *  handleLoadPackage("android") the settings provider is not up yet, so
+     *  the first read is deferred to the first hook call; a failed read
+     *  stays unloaded and is retried on later calls (defaults meanwhile:
+     *  feature on, nothing excluded). A ContentObserver keeps both values
+     *  live — switch and exclusion list apply without any restart. */
+    private static boolean freeRotOn() {
+        if (!sysCfgReady) {
+            ensureSysCfg();
+        }
+        return cfgFreeRot;
+    }
+
+    private static synchronized void ensureSysCfg() {
+        if (sysCfgReady) {
+            return;
+        }
+        Context ctx = sysCtx;
+        if (ctx == null) {
+            ctx = systemContext();
+            if (ctx == null) {
+                return; // retry on the next hook call
+            }
+            sysCtx = ctx;
+        }
+        try {
+            cfgFreeRot = Settings.System.getInt(ctx.getContentResolver(), KEY_FREE_ROT, 1) == 1;
+        } catch (Throwable t) {
+            return; // provider not up yet — retry later
+        }
+        cfgExclude = readExclude(ctx);
+        try {
+            if (cfgThread == null) {
+                cfgThread = new HandlerThread("CetusFreeRotCfg");
+                cfgThread.start();
+                cfgHandler = new Handler(cfgThread.getLooper());
+            }
+            ContentObserver obs = new ContentObserver(new Handler(cfgThread.getLooper())) {
+                @Override
+                public void onChange(boolean selfChange, Uri uri) {
+                    Context c = sysCtx;
+                    if (c == null) {
+                        return;
+                    }
+                    try {
+                        cfgFreeRot = Settings.System.getInt(
+                                c.getContentResolver(), KEY_FREE_ROT, 1) == 1;
+                    } catch (Throwable ignored) {
+                    }
+                    cfgExclude = readExclude(c);
+                    log("free-rot config reloaded: on=" + cfgFreeRot
+                            + " excluded=" + cfgExclude);
+                }
+            };
+            ctx.getContentResolver().registerContentObserver(
+                    Settings.System.getUriFor(KEY_FREE_ROT), false, obs);
+            ctx.getContentResolver().registerContentObserver(
+                    Settings.System.getUriFor(KEY_ROT_EXCLUDE), false, obs);
+        } catch (Throwable t) {
+            log("free-rot observer FAILED: " + t);
+        }
+        sysCfgReady = true;
+        log("free-rot config loaded: on=" + cfgFreeRot + " excluded=" + cfgExclude);
+    }
+
+    /** Exclusion list parser: semicolon-separated package names, blank
+     *  segments dropped. Only semantic: on the list = keep stock behavior. */
+    private static HashSet<String> readExclude(Context ctx) {
+        HashSet<String> set = new HashSet<String>();
+        try {
+            String raw = Settings.System.getString(ctx.getContentResolver(), KEY_ROT_EXCLUDE);
+            if (raw != null) {
+                for (String s : raw.split(";")) {
+                    s = s.trim();
+                    if (!s.isEmpty()) {
+                        set.add(s);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return set;
+    }
+
+    /** The system_server Context whose resolver serves settings. */
+    private static Context systemContext() {
+        try {
+            ClassLoader cl = sysLoader != null
+                    ? sysLoader : MainHook.class.getClassLoader();
+            Object at = XposedHelpers.callStaticMethod(XposedHelpers.findClass(
+                    "android.app.ActivityThread", cl),
+                    "currentActivityThread");
+            if (at == null) {
+                return null;
+            }
+            return (Context) XposedHelpers.callMethod(at, "getSystemContext");
+        } catch (Throwable t) {
+            log("systemContext failed: " + t);
+            return null;
+        }
+    }
+
+    /** f) live fold check: first the ROM's own global fold state — the very
+     *  call the MIUI orientation patch uses
+     *  (ActivityRecord.mAtmService.mWindowManager.mPolicy.isDisplayFolded())
+     *  — which closes the fold-transition window where a reparenting
+     *  record's merged configuration still lags its new display; then the
+     *  per-record discriminator smallestScreenWidthDp (cetus: inner 676dp,
+     *  cover 320dp, threshold 600 — same as the launcher-side hooks).
+     *  Anything that cannot be evaluated — including exceptions — closes to
+     *  "folded", so a rewrite can never reach the cover screen. */
+    private static boolean folded(Object r) {
+        try {
+            Object policy = XposedHelpers.getObjectField(
+                    XposedHelpers.getObjectField(
+                            XposedHelpers.getObjectField(r, "mAtmService"),
+                            "mWindowManager"),
+                    "mPolicy");
+            if ((Boolean) XposedHelpers.callMethod(policy, "isDisplayFolded")) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+            // policy unreachable — the per-record check still applies
+        }
+        try {
+            android.content.res.Configuration cfg =
+                    (android.content.res.Configuration) XposedHelpers.callMethod(
+                            r, "getConfiguration");
+            int sw = cfg.smallestScreenWidthDp;
+            if (sw > 0) {
+                return sw < 600;
+            }
+        } catch (Throwable ignored) {
+        }
+        return true;
+    }
+
+    /** g) multi-window and MIUI size-compat records keep stock orientation —
+     *  except MIUI parallel-window (embedded) records, which follow rotation
+     *  on the owner's request once the historic crash was re-attributed to a
+     *  third-party module's config conflict. APIs verified in this ROM:
+     *  ConfigurationContainer#inMultiWindowMode() (inherited),
+     *  ActivityRecord#inMiuiSizeCompatMode(), ActivityRecord
+     *  #mMiuiEmbeddingEnabled (ctor-final per-package flag, ~340/~1826).
+     *  Split-screen, freeform and every other multi-window kind stay stock.
+     *  Any failure or missing API closes to "not allowed". */
+    private static boolean windowingAllowed(Object r) {
+        try {
+            if ((Boolean) XposedHelpers.callMethod(r, "inMultiWindowMode")) {
+                if (!(Boolean) XposedHelpers.getBooleanField(r, "mMiuiEmbeddingEnabled")) {
+                    return false; // split-screen / freeform / pip: stock
+                }
+            }
+            if ((Boolean) XposedHelpers.callMethod(r, "inMiuiSizeCompatMode")) {
+                return false;
+            }
+        } catch (Throwable t) {
+            return false;
+        }
+        return true;
+    }
+
+    /** info.screenOrientation writer (engine case-1 parity). */
+    private static void setInfoOrientation(Object r, int value) {
+        try {
+            Object info = XposedHelpers.getObjectField(r, "info");
+            XposedHelpers.setIntField(info, "screenOrientation", value);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** Master-switch-off / excluded restore: undo W1's neutralization so
+     *  the record returns to the stock manifest orientation it registered
+     *  with. Records that were never neutralized (info still carries the
+     *  stock value) pass through untouched. */
+    private static void restoreStockOrientation(Object r) {
+        try {
+            Integer orig = ROT_REG.get(r);
+            if (orig == null || orig == -1) {
+                return;
+            }
+            Object info = XposedHelpers.getObjectField(r, "info");
+            if ((Integer) XposedHelpers.getIntField(info, "screenOrientation") == -1) {
+                XposedHelpers.setIntField(info, "screenOrientation", orig);
+                // re-issue through the stock path (our W1 hook no-ops for
+                // drawn records) so mOrientation and config propagation
+                // follow the same route the engine's restore used
+                XposedHelpers.callMethod(r, "setOrientation", orig, r);
+                log("restored stock orientation for " + pkgOf(r));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void logRewrite(String point, String pkg) {
+        synchronized (REWRITE_LOGGED) {
+            Integer n = REWRITE_LOGGED.get(pkg);
+            if (n != null && n >= 3) {
+                return;
+            }
+            REWRITE_LOGGED.put(pkg, n == null ? 1 : n + 1);
+        }
+        log(point + ": " + pkg + " -> follow system");
     }
 
     /** Append empty pages until the count is a multiple of the snap unit.

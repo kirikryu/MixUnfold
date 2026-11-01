@@ -13,7 +13,7 @@
 | 设备 | 小米 MIX FOLD 1（`cetus`），其它机型未验证 |
 | 系统 | HyperOS 1.0（Android 13），系统桌面 `com.miui.home` 4.39.12.x |
 | 框架 | LSPosed（需 root：Magisk / KernelSU） |
-| 作用域 | 系统桌面（`com.miui.home`）+ 系统界面（`com.android.systemui`） |
+| 作用域 | 系统桌面（`com.miui.home`）+ 系统界面（`com.android.systemui`）+ 系统框架（`android`） |
 
 系统桌面或 MIUI 大版本更新可能使模块失效，需等适配。
 
@@ -21,6 +21,9 @@
 
 - **桌面旋转解锁**：内屏展开后桌面跟随系统横竖旋转；折叠态外屏保持原版竖屏
 - **锁屏旋转解锁**：内屏展开态的锁屏跟随系统自动旋转；折叠态外屏锁屏保持竖屏
+- **内屏自由旋转**：内屏展开时所有应用跟随系统自动旋转（含原生锁定方向的
+  应用），可按应用排除；相机类应用永远不参与；折叠态外屏任何应用都保持
+  原版竖屏
 - **统一网格**：桌面列数横竖屏一致（默认 3 列），避免同一份图标数据库在两种
   列数间切换导致的小组件遮挡
 - **横屏页数可选（2/3 页）**：两页模式自动反向对齐，页缝两侧列距一致，
@@ -38,8 +41,9 @@
    adb install -r MixUnfold.apk
    ```
 
-3. LSPosed → 模块 → 启用 **MixUnfold** → 作用域勾选 **系统桌面** 与
-   **系统界面**（两个都要勾）
+3. LSPosed → 模块 → 启用 **MixUnfold** → 作用域勾选 **系统桌面**、
+   **系统界面** 与 **系统框架**（三个都要勾；重装模块后系统框架偶发需要
+   重新确认）
 4. 重启桌面：模块内「重启系统桌面」按钮，或
    `adb shell am force-stop com.miui.home`
 5. 确认生效：内屏展开后桌面横放跟随旋转；或执行
@@ -60,6 +64,8 @@
 | 横屏同屏页数 | 3 | 下拉选择 2 页 / 3 页 |
 | 屏幕外侧边距优化 | 关 | 开启后边距自动取固定值（竖 120 / 横 280 或 0 px），不可手调；关闭则保持小米原版边距 |
 | 锁屏允许横屏 | 开 | 内屏展开态锁屏跟随旋转；关闭并重启系统界面即恢复原版 |
+| 内屏自由旋转 | 开 | 总开关：内屏展开时所有应用跟随系统自动旋转，即时生效 |
+| 排除应用 | 空 | 应用列表勾选（带搜索）；清单内的应用维持原厂方向行为，即时生效 |
 
 - 改完数值点 **应用设置**（首次弹出 root 授权，请允许），再点
   **重启系统桌面** 生效；重启后建议横竖屏切换几次，让布局优化完全应用
@@ -75,13 +81,17 @@ adb shell settings put system cetus_home_land_pages 3
 adb shell settings put system cetus_home_lockscreen_rot 1
 adb shell am force-stop com.miui.home            # 桌面设置改动后重启桌面
 adb shell pkill -f com.android.systemui          # 锁屏设置改动后重启系统界面
+
+# 内屏自由旋转（即时生效，无需重启）
+adb shell settings put system cetus_free_rot 1
+adb shell settings put system cetus_free_rot_exclude com.foo;com.bar
 ```
 
 ## 常见问题
 
 **模块没生效？** 按顺序检查：
 
-1. LSPosed 中模块已启用，作用域 **系统桌面** 与 **系统界面** 都已勾选
+1. LSPosed 中模块已启用，作用域 **系统桌面**、**系统界面** 与 **系统框架** 都已勾选
 2. 已重启桌面（改过锁屏开关的，已重启系统界面或整机）
 3. `adb logcat -d | grep CetusHomeHook` 有 `init complete`；没有 → 整机重启一次
 4. 系统桌面版本是否为 4.39.12.x（其它版本未验证）
