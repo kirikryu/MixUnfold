@@ -340,11 +340,19 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
   化到自身设置文件。同步在配置线程执行（避免 WMS 锁内做 PM 查询）。
 - **总开关语义**：关 → `isEnabled()` 恢复 false → 引擎休眠、全机原厂
   （允许表文件残留但引擎不读，无行为影响）。
-- **已知限制**：引擎允许表在开机首次 isEnabled 调用与排除清单变更时全量
-  重建，新安装应用需一次重启或任意排除变更才跟随内屏旋转（后续可加
-  PACKAGE_ADDED 增量同步；选择器自身的应用列表已实时刷新：onResume 重查
-  + 安装/替换/卸载广播）；外屏 LOCKED 对在折叠事件时应用，开机即折叠的
-  场景需一次折叠循环生效。
+- **已知限制（排除清单变更需重启才完美应用，机主标记待修）**：引擎在
+  允许表命中时于**写点持久中和**记录（`info.screenOrientation` 与
+  `mOrientation` 均写为 -1），允许表变更对存量记录不追溯，两个方向的
+  即时性都不完整：
+  1. 新装应用不在允许表 → 不跟随（需重启或任意排除变更触发重建）；
+  2. 新排除的应用此前已被中和 → 存量 ActivityRecord 仍保持跟随（需重启
+     或该记录重建）。
+  修复方向：排除变更时按允许表 diff 对存量记录做**反向还原**（等价于
+  第 10 节 W2 时代的 `restoreStockOrientation`：把 `info.screenOrientation`
+  /`mOrientation` 写回原厂值，该实现仍在引擎模式的回退代码里可复用）；
+  新装应用监听 PACKAGE_ADDED 增量同步。选择器自身的应用列表已实时刷新
+  （onResume 重查 + 安装/替换/卸载广播）。外屏 LOCKED 对在折叠事件时
+  应用，开机即折叠的场景需一次折叠循环生效。
 - **侦察记录**：`MiuiStubUtil` 与引擎策略不在 services.jar（在
   miui-services.jar / miui-framework），`TaskSnapshot` 类在 system_server
   类加载器不可解析（W5 按名挂钩的原因）；引擎模式下 `systemContext()`
