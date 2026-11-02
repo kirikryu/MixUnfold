@@ -4,8 +4,17 @@
 版本历史自 v1.6.2 起（更早无记录）；每个版本的完整改动见
 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)。
 
-## [未发布]
+## [1.8.1] - 2026-11-02
 
+- 修复：MIUI 平行窗口应用内运行期方向请求（公众号文章页、详情页等
+  `setRequestedOrientation` 竖屏锁定页）未被中和，把整个应用与显示钉死
+  竖屏——引擎对多窗口记录的写点豁免是原生行为，未指定方向的记录此前只是
+  巧合地跟随自由显示旋转。新增 E1 钩子双路桥接（通用机制，非单应用特例）：
+  E1a 打开嵌入控制器读点的编译期旋转开关（cetus
+  `config_embedded_activity_rotate=false`，惠及规则内嵌入应用）；E1b 对
+  平行窗口记录（嵌入 TaskFragment 或 magic-window 窗口模式）中和运行期
+  方向请求（legacy W1 的引擎模式孪生：总开关/排除清单/折叠态/size-compat
+  门控与即时还原全部沿用，写点双写消除竖屏闪帧）
 - 修复：排除应用选择器不显示新安装的应用——应用列表此前仅在页面创建时
   加载一次，选择器驻留后台期间新装的应用不会出现；现改为每次回到页面
   重新查询，并在页面存续期间监听安装/替换/卸载广播实时刷新；列表为空时
@@ -77,6 +86,7 @@
 - 横屏三页模式（可选）
 - 控制面板：滑杆调参 + 一键重启桌面
 
+[1.8.1]: https://github.com/kirikryu/MixUnfold/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/kirikryu/MixUnfold/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/kirikryu/MixUnfold/compare/v1.6.5...v1.7.0
 [1.6.5]: https://github.com/kirikryu/MixUnfold/compare/v1.6.4...v1.6.5
