@@ -33,7 +33,8 @@ done
 [ "${RELEASE_BUILD:-0}" = "1" ] && MODE=release
 
 JDK_BIN="${JDK_BIN:-/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home/bin}"
-BT="${BT:-/opt/homebrew/share/android-commandlinetools/build-tools/34.0.0}"
+# build-tools 36 起的 d8 才支持 miuix/Compose 1.11 的 Java 21 字节码（major 65）
+BT="${BT:-/opt/homebrew/share/android-commandlinetools/build-tools/36.0.0}"
 AJ="${AJ:-/opt/homebrew/share/android-commandlinetools/platforms/android-35/android.jar}"
 OUT="${OUT:-releases/MixUnfold.apk}"
 API=27
@@ -72,7 +73,7 @@ setup_debug_signing() {
             echo "error: DEBUG_STORE_FILE 不存在: $KS" >&2
             exit 1
         fi
-        echo "[0/6] generating standard debug keystore ($KS)"
+        echo "[0/7] generating standard debug keystore ($KS)"
         mkdir -p "$(dirname "$KS")"
         "$JDK_BIN/keytool" -genkeypair -keystore "$KS" -alias "$KS_ALIAS" \
             -keyalg RSA -keysize 2048 -validity 10950 \
@@ -147,7 +148,7 @@ EOF
         echo "error: keystore 文件不存在: $KS（检查 storeFile / RELEASE_STORE_FILE）" >&2
         exit 1
     fi
-    echo "[0/6] release signing: $KS_ALIAS <- $(basename "$KS")（来源: ${src}）"
+    echo "[0/7] release signing: $KS_ALIAS <- $(basename "$KS")（来源: ${src}）"
 }
 
 if [ "$MODE" = release ]; then
@@ -156,36 +157,106 @@ else
     [ -f "$ROOT/signing.properties" ] && \
         echo "note: debug 构建；忽略 signing.properties（release 构建用 --release）"
     setup_debug_signing
-    echo "[0/6] debug signing: $KS_ALIAS <- $KS"
+    echo "[0/7] debug signing: $KS_ALIAS <- $KS"
 fi
 
 # --- compile / package -------------------------------------------------------
 
-echo "[1/6] javac"
-rm -rf build && mkdir -p build/assets build/classes
+# miuix (Compose) 设置页需要 Kotlin/Compose 工具链与 AAR 闭包，全部钉版本
+# 由 tools/fetch-deps.sh 下载到 build/deps/（首次构建约 100MB，之后离线）。
+DEPS=build/deps
+KOTLINC="$DEPS/kotlinc/bin/kotlinc"
+AJ36="$DEPS/android-36/android.jar"
+PLUGIN="$DEPS/tools/compose-compiler-plugin.jar"
+if [ ! -x "$KOTLINC" ] || [ ! -f "$AJ36" ] || [ ! -f "$PLUGIN" ]; then
+    ./tools/fetch-deps.sh
+fi
+
+echo "[1/7] kotlinc + javac"
+rm -rf build/classes build/kotlin_classes build/assets build/res-*.zip
+rm -f build/classes*.dex build/base.apk build/aligned.apk build/d8-inputs.txt
+mkdir -p build/assets build/classes build/kotlin_classes
+
+# Kotlin（设置页）：Java 源一并传入仅供解析（kotlinc 不编译它们）；
+# classpath = 依赖闭包的 class jar + API 36 android.jar（Compose 1.11 要求）
+DEP_JARS="$(find "$DEPS/classes" -name '*.jar' | sort | tr '\n' ':')"
 # shellcheck disable=SC2046
-"$JDK_BIN/javac" -source 8 -target 8 -Xlint:-options -cp "$AJ" -d build/classes \
+"$KOTLINC" -jvm-target 1.8 \
+    -Xplugin="$PLUGIN" \
+    -cp "$DEP_JARS$AJ36" \
+    -d build/kotlin_classes \
+    $(find app/src -name '*.kt') \
     $(find app/src -name '*.java') \
     $(find app/stubs -name '*.java')
 
-echo "[2/6] d8"
+# Java（hook + AppPicker）：约定不变（-source/-target 8），classpath 加
+# Kotlin 输出以支持少量 Java→Kotlin 引用
 # shellcheck disable=SC2046
-"$BT/d8" --release --min-api "$API" --output build \
-    $(find build/classes/cetushome -name '*.class')
+"$JDK_BIN/javac" -source 8 -target 8 -Xlint:-options \
+    -cp "$AJ:build/kotlin_classes" -d build/classes \
+    $(find app/src -name '*.java') \
+    $(find app/stubs -name '*.java')
 
-echo "[3/6] package"
+echo "[2/7] resources + library R"
 cp app/assets/xposed_init build/assets/xposed_init
+# 自身 + 依赖 AAR 的资源：aapt2 compile 成 flat zip 后并入 link
+"$BT/aapt2" compile --dir app/res -o build/res-app.zip
+RES_ARGS=("-R" "$PWD/build/res-app.zip")
+# androidx AAR 不携带 R 类（AGP 在应用构建期按最终资源 ID 重建）：这里对每个
+# 带资源的 AAR 读其 manifest package，用 --extra-packages 生成对应 R.java，
+# 编译后一并 dex，否则库代码运行期 NoClassDefFoundError。
+EXTRA_ARGS=()
+seen_pkgs=" "
+for rd in "$DEPS"/res/*/; do
+    [ -d "$rd" ] || continue
+    name="$(basename "$rd")"
+    "$BT/aapt2" compile --dir "$rd" -o "build/res-$name.zip"
+    RES_ARGS+=("-R" "$PWD/build/res-$name.zip")
+    aar="$(ls "$DEPS/aar/$name"-*.aar 2>/dev/null | head -1)"
+    [ -n "$aar" ] || { echo "warn: $name 找不到对应 AAR，跳过库 R 生成" >&2; continue; }
+    # androidx AAR 的 manifest 是纯文本 XML（部分新版是 proto，本闭包内均为文本）
+    pkg="$(unzip -p "$aar" AndroidManifest.xml \
+        | grep -m1 -oE 'package="[^"]+"' | cut -d'"' -f2)"
+    [ -n "$pkg" ] || { echo "warn: $name manifest 无 package，跳过库 R 生成" >&2; continue; }
+    case "$seen_pkgs" in
+        *" $pkg "*) ;;
+        *)  seen_pkgs="$seen_pkgs$pkg "
+            EXTRA_ARGS+=("--extra-packages" "$pkg") ;;
+    esac
+done
+rm -rf build/r-gen build/r-classes
+# link 只产出资源与 R.java；dex 在下一步生成后回填进 base.apk
 (cd build \
-    && "$BT/aapt2" link -o base.apk -I "$AJ" \
+    && "$BT/aapt2" link -o base.apk -I "$ROOT/$DEPS/android-36/android.jar" \
         --manifest ../app/AndroidManifest.xml \
         --min-sdk-version "$API" --target-sdk-version 30 \
-    && zip -q base.apk classes.dex \
+        --auto-add-overlay --java r-gen "${EXTRA_ARGS[@]}" \
+        "${RES_ARGS[@]}")
+# 编译各库 R（引用 android.jar 常量即可），并入 dex
+# shellcheck disable=SC2046
+"$JDK_BIN/javac" -source 8 -target 8 -Xlint:-options -cp "$AJ" \
+    -d build/r-classes $(find build/r-gen -name '*.java')
+"$JDK_BIN/jar" --create --file build/app-r-classes.jar -C build/r-classes .
+
+echo "[3/7] d8"
+# build-tools 34 的 d8 不收目录/输入清单：先把应用类目录打成 jar，
+# 再与全部依赖 class jar 一起 dex；--lib 用 API 36 jar（desugar 上下文）。
+"$JDK_BIN/jar" --create --file build/app-java-classes.jar -C build/classes .
+"$JDK_BIN/jar" --create --file build/app-kt-classes.jar -C build/kotlin_classes .
+# shellcheck disable=SC2046
+"$BT/d8" --release --min-api "$API" --lib "$AJ36" --output build \
+    build/app-java-classes.jar build/app-kt-classes.jar build/app-r-classes.jar \
+    $(find "$DEPS/classes" -name '*.jar')
+
+echo "[4/7] package"
+(cd build \
+    && zip -q base.apk classes*.dex \
     && zip -q base.apk assets/xposed_init)
 
-echo "[4/6] zipalign"
+echo "[5/7] zipalign"
 "$BT/zipalign" -f -p 4 build/base.apk build/aligned.apk
 
-echo "[5/6] apksigner ($MODE)"
+echo "[6/7] apksigner ($MODE)"
 # OUT 所在目录不随仓库分发（releases/ 被 gitignore），签名前确保存在
 mkdir -p "$(dirname "$OUT")"
 export MIXUNFOLD_KS_PASS="$KS_PASS" MIXUNFOLD_KEY_PASS="$KEY_PASS"
@@ -195,7 +266,7 @@ export MIXUNFOLD_KS_PASS="$KS_PASS" MIXUNFOLD_KEY_PASS="$KEY_PASS"
     --out "$OUT" build/aligned.apk
 unset MIXUNFOLD_KS_PASS MIXUNFOLD_KEY_PASS
 
-echo "[6/6] verify"
+echo "[7/7] verify"
 "$BT/apksigner" verify --print-certs "$OUT"
 
 echo "OK -> $OUT ($MODE 签名)"

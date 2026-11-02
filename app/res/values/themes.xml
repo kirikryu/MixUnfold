@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 设置页宿主主题：Compose(miux) 自绘全部颜色，框架主题只负责窗口底色与
+     去掉 ActionBar。DeviceDefault 在 HyperOS/MIUI 上自动跟随系统深浅色。 -->
+<resources>
+    <style name="Theme.MixUnfold" parent="@android:style/Theme.DeviceDefault.NoActionBar" />
+</resources>

@@ -51,12 +51,12 @@ jobs:
           SDKM="$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1)"
           echo "sdkmanager: $SDKM"
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
-          "$SDKM" "build-tools;34.0.0" "platforms;android-35" >/dev/null
+          "$SDKM" "build-tools;36.0.0" "platforms;android-35" >/dev/null
 
       - name: Build APK (debug signing)
         run: |
           export JDK_BIN="$JAVA_HOME/bin"
-          export BT="$ANDROID_HOME/build-tools/34.0.0"
+          export BT="$ANDROID_HOME/build-tools/36.0.0"
           export AJ="$ANDROID_HOME/platforms/android-35/android.jar"
           ./build.sh
 
@@ -81,7 +81,7 @@ jobs:
           SDKM="$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1)"
           echo "sdkmanager: $SDKM"
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
-          "$SDKM" "build-tools;34.0.0" "platforms;android-35" >/dev/null
+          "$SDKM" "build-tools;36.0.0" "platforms;android-35" >/dev/null
 
       # tag 构建必须产出官方签名的发布版：缺 Secrets 直接失败，
       # 绝不允许回退 debug 签名冒充官方发布。
@@ -108,7 +108,7 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASS }}
         run: |
           export JDK_BIN="$JAVA_HOME/bin"
-          export BT="$ANDROID_HOME/build-tools/34.0.0"
+          export BT="$ANDROID_HOME/build-tools/36.0.0"
           export AJ="$ANDROID_HOME/platforms/android-35/android.jar"
           ./build.sh --release
 
@@ -120,7 +120,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          BT="$ANDROID_HOME/build-tools/34.0.0"
+          BT="$ANDROID_HOME/build-tools/36.0.0"
           APK=releases/MixUnfold.apk
           "$BT/apksigner" verify --print-certs "$APK"
           # 校验值只写入附件 SHA256SUMS.txt，不进 Release 正文

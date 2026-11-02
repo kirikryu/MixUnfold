@@ -24,7 +24,8 @@
         <activity
             android:name="cetushome.hook.MainActivity"
             android:exported="true"
-            android:label="MixUnfold">
+            android:label="MixUnfold"
+            android:theme="@style/Theme.MixUnfold">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

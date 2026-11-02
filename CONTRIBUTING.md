@@ -14,14 +14,19 @@
 
 - macOS（构建脚本默认按 Homebrew 路径查找依赖）
 - JDK 17
-- Android build-tools 34.0.0（`aapt2` / `d8` / `zipalign` / `apksigner`）
-- android-35 的 `android.jar`
+- Android build-tools 36.0.0（`aapt2` / `d8` / `zipalign` / `apksigner`；
+  d8 需 ≥36 才能处理 miuix/Compose 的 Java 21 字节码）
+- android-35 的 `android.jar`（Java 源编译用；Kotlin/Compose 另用
+  API 36 jar，由依赖脚本自动下载）
+- Kotlin 2.4 工具链与 miuix/Compose AAR 闭包：**首次构建自动下载**
+  （约 300MB 到 `build/deps/`，gitignored，之后离线可构建）；版本全部
+  钉死在 `tools/fetch-deps.sh`，可用 `--force` 强制重新下载
 
 路径不标准时用环境变量覆盖：
 
 ```bash
 JDK_BIN=/path/to/jdk17/bin \
-BT=/path/to/build-tools/34.0.0 \
+BT=/path/to/build-tools/36.0.0 \
 AJ=/path/to/platforms/android-35/android.jar \
 ./build.sh
 ```
@@ -33,8 +38,10 @@ AJ=/path/to/platforms/android-35/android.jar \
 adb install -r releases/MixUnfold.apk
 ```
 
-流程：`javac`（源码 + `app/stubs/` 的 Xposed stub）→ `d8` → `aapt2 link`
-→ `zipalign` → `apksigner`。无 Gradle，全部在 `build.sh` 中。
+流程：`kotlinc`（设置页，Compose 编译器插件）→ `javac`（源码 +
+`app/stubs/` 的 Xposed stub）→ `aapt2 link`（自身 + 各 AAR 资源，
+并为各库重建 R 类）→ `d8` → `zipalign` → `apksigner`。
+无 Gradle，全部在 `build.sh` 中。
 
 ### 签名与构建
 

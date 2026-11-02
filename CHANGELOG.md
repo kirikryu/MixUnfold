@@ -6,6 +6,17 @@
 
 ## [未发布]
 
+- 变更：主设置页改用开源 Compose UI 库 [miuix](https://github.com/compose-miuix-ui/miuix)
+  重写（HyperOS 风格：卡片分区、开关/滑杆/下拉偏好组件），设置项、存储键
+  与写入逻辑（`Settings.System` + 400ms 防抖 + root 兜底）完全不变；
+  构建链相应扩展：`build.sh` 新增 Kotlin 2.4 + Compose 编译器插件，依赖
+  闭包（miuix/Compose/androidx 约 55 个 AAR）由 `tools/fetch-deps.sh`
+  钉版本下载到 `build/deps/`（首次构建自动联网下载，之后离线），
+  build-tools 需求从 34 升至 36（d8 需支持 Java 21 字节码）；「排除应用」
+  子页仍为原生 View 实现，行为不变
+- 注意：Android 14+ 平台对非 root 直写 `Settings.System` 任意新键收紧
+  （`SettingsProvider` 拒绝未登记键），无 root 场景需保持授予「修改系统
+  设置」；cetus 实机 HyperOS（Android 12/13）无此限制，写入逻辑未变
 - 修复：排除应用选择器不显示新安装的应用——应用列表此前仅在页面创建时
   加载一次，选择器驻留后台期间新装的应用不会出现；现改为每次回到页面
   重新查询，并在页面存续期间监听安装/替换/卸载广播实时刷新；列表为空时
