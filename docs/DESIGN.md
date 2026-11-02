@@ -62,9 +62,9 @@
 另有 `Application.onCreate` after 中注册的进程内广播接收器
 （`cetushome.rotationunlock.RESTART`），供控制面板触发桌面重启。
 
-第三目标进程 `system_server`：**引擎模式（E0，见第 11 节）**——点亮休眠的
-MIUI 折叠横屏引擎并桥接排除清单；第 10 节的 W1–W5 为引擎不可用时的
-回退实现（当前 ROM 已验证引擎可用，未注册）。
+第三目标进程 `system_server`：**引擎模式（E0+E1，见第 11 节）**——点亮休眠的
+MIUI 折叠横屏引擎并桥接排除清单（E0）与平行窗口旋转（E1）；第 10 节的
+W1–W5 为引擎不可用时的回退实现（当前 ROM 已验证引擎可用，未注册）。
 
 另一目标进程 `com.android.systemui`（锁屏旋转解锁，根因与风险见第 9 节）：
 
@@ -330,7 +330,8 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
   （`accelerometer_rotation_outer/inner`、`user_rotation_outer/inner`，
   折叠切换时经 `setUserRotation` 应用，外屏默认 LOCKED 竖屏、显式横屏
   （视频全屏）放行——第 10 节 W4 的语义原生成立）；嵌入记录引擎原生
-  豁免（`isEmbedded(r)` → stock）；相机有专属策略
+  豁免（`isNeedUpdateConfig` 对嵌入记录返回 false → 引擎不干预；平行窗口
+  的方向入口是嵌入控制器，由 E1 接管，见下）；相机有专属策略
   （`FullScreen3AppCameraStrategy`）。
 - **允许表桥接**：引擎内屏解锁是**按包允许表**（system/user 两级 map，
   cetus 系统表为空 → 不桥接则全 stock）。模块在首次 isEnabled 调用与
@@ -338,6 +339,55 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
   桌面（com.miui.home，保留桌面侧自有钩子）**，值 `nr`（FULL_LANDSCAPE
   使能位），经 `clearUserSettings + setUserSettings` 全量重建，引擎持久
   化到自身设置文件。同步在配置线程执行（避免 WMS 锁内做 PM 查询）。
+- **平行窗口旋转桥接（E1a + E1b）**：引擎对平行窗口是双重豁免——求值豁免
+  （`isNeedUpdateConfig` 对嵌入记录返回 false）且**写点豁免**（services.jar
+  MIUI 补丁：`inMultiWindowMode()` → `super.setOrientation(请求值)` 直通，
+  运行期方向请求从未被任何机制中和）。实机（微信公众号文章页复现）定位出
+  两条独立链路，分别桥接：
+
+  - **E1a（读点门，惠及规则内嵌入应用）**：嵌入控制器
+    （`com.android.server.wm.MiuiActivityEmbeddingController`，
+    miui-embedding-window.jar 随包反编译复核）的旋转支持在 cetus 编译关闭：
+    构造期 `mSupportGlobalRotation = MiuiEmbeddingWindowStub.IS_TABLET ? true
+    : resources.getBoolean(0x11050022)`（即
+    `android.miui:bool/config_embedded_activity_rotate`，cetus false），字段
+    全 jar 仅 `shouldOverrideOrientation` 一处读，且为 false 时
+    `overrideOrientation` 恒返回 -3（UNSET）。调用链：`ActivityRecord.
+    getOrientation(int)`（MIUI 覆写，第 10 节 W2 所指 ~7206 处）每次求值、于
+    `mOrientation` 之前调用
+    `MiuiEmbeddingWindowServiceStub.get().overrideOrientation(this)`。
+    E1a = 按方法名 hook `shouldOverrideOrientation`（同 S1/W5 避开参数类型
+    耦合）：总开关关 / 相机 / 排除清单命中 → 强制 false（与 stock 字段 false
+    逐位一致）；否则逐次置 true 放行——嵌入规则、可见性、`!isDisplayFolded()`
+    （合盖外屏永不通过）等 stock 门控保持原语义。
+    **实测边界（重要）**：动态嵌入规则 `isEmbeddingEnabledForPackage` 对
+    **自适配平行窗口应用恒为 false**（微信实测：静态配置表
+    `cmd miui_embedding_window dump-rule` 显示 `EmbeddedEnable->true`，
+    但动态判定叠加 `isAppSelfAdaptEmbed` / `isAppNeedSystemAdaptation` /
+    `mFullRules` / `mSizeCompatRules` 检查后恒 false——微信走自家 magic-window
+    适配 + freeform 管理，不受系统嵌入规则管辖；开机即 false 且整个会话无
+    翻转）。E1a 对这类应用从未生效；
+  - **E1b（写点中和，覆盖自适配平行窗口）**：平行窗口此前"能横屏"的真相是
+    **未指定方向的记录（manifest UNSPECIFIED）跟随自由的显示旋转**，与嵌入
+    路径无关；而应用在平行窗口内运行期调 `setRequestedOrientation(PORTRAIT)`
+    （微信文章页实锤：`mOriginScreenOrientation=UNSPECIFIED` 但
+    `mOriginRequestOrientation=PORTRAIT`，经 `ActivityRecord.setOrientation`
+    落盘 `mOrientation=1`）会把整个任务与显示钉死竖屏，物理重转才偶发恢复、
+    锁定方向时粘死。E1b = hook `ActivityRecord.setOrientation(int,
+    WindowContainer)`（legacy W1 的引擎模式孪生）：请求 ∉ {-1,-2,3}、总开关
+    开、非相机、非排除、**平行窗口记录**（live `isEmbedded()` 或 magic-window
+    窗口模式 101 "miui-magic-windows"；分屏/小窗/PIP 与全屏记录不命中——
+    全屏记录归引擎自身写路径管）且非折叠、非 size-compat 时双写中和
+    （`args[0]=-1` + `info.screenOrientation=-1`，引擎 case-1 等效），计入
+    `ROT_REG`；总开关关闭/排除变更时经 `restoreStockOrientation` 重发原请求
+    即时还原（钩子门控失效后自然放行）。**折叠门教训**：平行窗口窗格的合并
+    配置 `smallestScreenWidthDp≈338dp`（窄竖栏），第 10 节 f 门的"per-record
+    sw<600 视为折叠外屏"判定会把展开内屏上的窗格记录**误判为折叠**导致改写
+    永不命中——E1b 的折叠门只查 ROM 全局折叠态
+    （`mPolicy.isDisplayFolded()`，与第 10 节 f 门第一段同源），查询失败保守
+    跳过，外屏保障不变。即时性与允许表不同：写点/读点逐次求值、无持久状态，
+    总开关与排除清单变更即时生效。
+  - 仅引擎模式注册（legacy W1–W5 的 g 门本就放行嵌入记录，再挂会双重接管）。
 - **总开关语义**：关 → `isEnabled()` 恢复 false → 引擎休眠、全机原厂
   （允许表文件残留但引擎不读，无行为影响）。
 - **已知限制（排除清单变更需重启才完美应用，机主标记待修）**：引擎在

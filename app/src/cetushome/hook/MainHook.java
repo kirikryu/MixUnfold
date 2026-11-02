@@ -75,16 +75,22 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *     Governed by the "锁屏允许横屏" switch (cetus_home_lockscreen_rot).
  *
  * A third target is system_server (LSPosed scope 系统框架/"android"):
- * W1/W2/W3 inner-screen free rotation (see hookSystemServer). MIUI's fold
- * orientation engine ships in services.jar but is disabled on cetus
- * (ro.config.miui_orientation_enable unset — every call site is gated by
- * MiuiOrientationStub.isEnabled(), verified dead), so apps run on their
- * manifest orientation. Rather than that dead write point, the two live
- * read points are rewritten to the engine's effective output:
- * UNSPECIFIED (orientation preference) and ORIENTATION_UNDEFINED
- * (configuration orientation). The unfolded inner display then follows
- * auto-rotate for every registered app; the folded cover screen is never
- * touched (live per-record fold gate, failures closed to "no rewrite").
+ * inner-screen free rotation (see hookSystemServer). The shipped path is
+ * ENGINE MODE: the full MIUI fold orientation engine (MiuiOrientationImpl,
+ * miui-services.jar) is dormant on cetus (isEnabled() gated by
+ * ro.config.miui_orientation_enable, unset) but complete, so hook E0
+ * lights it up behind the master switch — native write-time neutralization,
+ * per-display rotation-lock separation, allowlist bridged from the user
+ * exclusion list. The engine exempts parallel-window records entirely
+ * (evaluation and write path), which E1 bridges: E1a opens the embedding
+ * controller's compiled-off rotation gate for rule-true embedded apps, E1b
+ * neutralizes runtime orientation requests from parallel-window records
+ * (the WeChat-article-page portrait stick). The legacy W1-W5 hand-written
+ * read/write point rewrites remain
+ * in the source as a fallback for ROMs without the engine impl class; on
+ * those, the unfolded inner display follows auto-rotate for every
+ * registered app and the folded cover screen is never touched (live
+ * per-record fold gate, failures closed to "no rewrite").
  *
  * Settings are read ONCE per process into a static cache and refreshed by
  * restarting the process (launcher from the module UI; SystemUI via
@@ -1033,7 +1039,12 @@ public class MainHook implements IXposedHookLoadPackage {
     //  - native per-display rotation-lock separation: outer pair LOCKED/
     //    portrait (free-rotating apps stay portrait on the cover), explicit
     //    landscape (video fullscreen) still rotates, inner screen free;
-    //  - embedded/parallel-window records exempted natively (stock);
+    //  - embedded/parallel-window records exempted natively (stock) — the
+    //    engine never sees them, and its write path skips every multi-window
+    //    record outright; E1 bridges both gaps (E1a: embedding controller
+    //    read-point config gate, rule-true apps only; E1b: write-point
+    //    neutralization for parallel-window records — see
+    //    hookEmbeddingRotation);
     //  - per-package allowlist persisted to a settings file.
     // The engine's inner unlock is allowlist-based, so this module bridges
     // its exclusion semantics onto it: user settings = all installed
@@ -1174,6 +1185,181 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
+     * E1 — parallel-window (embedded / magic-window) rotation bridge, two
+     * halves. The E0 engine exempts multi-window records from its write path
+     * (ActivityRecord.setOrientation MIUI patch: inMultiWindowMode -> super
+     * straight, the requested value stands) and exempts embedded records from
+     * its evaluation entirely (isNeedUpdateConfig -> false); parallel windows
+     * are therefore governed by the embedding controller, whose rotation
+     * support is compiled off on cetus (config_embedded_activity_rotate,
+     * 0x11050022, false).
+     *
+     * a) read-point config gate: raise mSupportGlobalRotation per call in
+     *    shouldOverrideOrientation (the field's only reader, decompiled
+     *    miui-embedding-window.jar). Lets rule-true embedded apps rotate
+     *    through the ROM's own path, stock gates (visibility, folding)
+     *    untouched. Device-verified limit: self-adapt parallel-window apps
+     *    (WeChat) fail the DYNAMIC isEmbeddingEnabledForPackage check
+     *    permanently even though the static rule dump says enabled, so (a)
+     *    never fires for them — hence (b).
+     *
+     * b) write-point neutralization for parallel-window records: their
+     *    runtime setRequestedOrientation calls are never neutralized by the
+     *    engine (the multi-window exemption), so an app calling
+     *    setRequestedOrientation(PORTRAIT) from a pane pins the whole app —
+     *    and the display — portrait (WeChat article page: manifest is
+     *    UNSPECIFIED, the page requests PORTRAIT at runtime; plain parallel
+     *    windows had appeared to work only because unspecified records
+     *    follow the free display rotation). (b) absorbs concrete requests
+     *    under the same gates and tradeoffs as legacy W1: switch on, not
+     *    camera or excluded, parallel-window only (live isEmbedded() or
+     *    magic-window mode 101 — split-screen, freeform and PIP keep stock;
+     *    fullscreen records stay with the engine's own path), unfolded, not
+     *    MIUI size-compat; engine case-1 parity double-write (args[0]=-1 +
+     *    info.screenOrientation=-1). Registered in ROT_REG so
+     *    restoreStockOrientation re-issues the original request when the
+     *    switch goes off or the package is excluded — the hook then no-ops
+     *    because its gates fail.
+     */
+    private static void hookEmbeddingRotation(XC_LoadPackage.LoadPackageParam lpp) {
+        final Class<?> ctrlCls;
+        try {
+            ctrlCls = XposedHelpers.findClass(
+                    "com.android.server.wm.MiuiActivityEmbeddingController", lpp.classLoader);
+        } catch (Throwable t) {
+            log("E1 unavailable (no embedding controller): " + t);
+            return;
+        }
+        try {
+            // a) hookAllMethods by name: avoids coupling to the ActivityRecord
+            // parameter type, same rationale as S1/W5
+            XposedBridge.hookAllMethods(ctrlCls, "shouldOverrideOrientation",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                if (!freeRotOn()) {
+                                    param.setResult(false); // d: stock everywhere
+                                    return;
+                                }
+                                String pkg = pkgOf(param.args[0]);
+                                if (pkg != null && (CAMERA_PKGS.contains(pkg)
+                                        || cfgExclude.contains(pkg))) {
+                                    param.setResult(false); // c/e: manifest orientation stands
+                                    return;
+                                }
+                                // open the ROM's config gate for this evaluation;
+                                // stock gates below keep their full meaning
+                                XposedHelpers.setBooleanField(
+                                        param.thisObject, "mSupportGlobalRotation", true);
+                            } catch (Throwable t) {
+                                // any failure keeps the stock (locked) decision
+                            }
+                        }
+                    });
+            log("hook E1a ok: embedding controller config gate (rule-true apps)");
+        } catch (Throwable t) {
+            log("hook E1a FAILED: " + t);
+        }
+        // b) engine-mode twin of legacy W1, scoped to parallel windows
+        final Class<?> actRecCls;
+        final Class<?> wcCls;
+        try {
+            actRecCls = XposedHelpers.findClass(
+                    "com.android.server.wm.ActivityRecord", lpp.classLoader);
+            wcCls = XposedHelpers.findClass(
+                    "com.android.server.wm.WindowContainer", lpp.classLoader);
+        } catch (Throwable t) {
+            log("E1b unavailable (ActivityRecord/WindowContainer): " + t);
+            return;
+        }
+        try {
+            XposedHelpers.findAndHookMethod(actRecCls, "setOrientation",
+                    int.class, wcCls, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                int req = (Integer) param.args[0];
+                                if (req == -1 || req == -2 || req == 3) {
+                                    return; // follow/unset/behind: nothing to absorb
+                                }
+                                if (!freeRotOn()) {
+                                    return; // d — also the restore re-entry path
+                                }
+                                Object r = param.thisObject;
+                                String pkg = pkgOf(r);
+                                if (pkg == null || CAMERA_PKGS.contains(pkg)
+                                        || cfgExclude.contains(pkg)) {
+                                    return; // c/e — restore reachability
+                                }
+                                if (!parallelWindow(r)) {
+                                    return; // fullscreen: the engine's own path owns it
+                                }
+                                // f: parallel-window records live on the inner
+                                // display — the per-record smallestScreenWidthDp
+                                // check is meaningless here (a magic-window pane
+                                // merges sw338dp, would always read "folded").
+                                // Gate on the ROM's global fold state only; any
+                                // failure closes to "no rewrite" (cover guarantee)
+                                try {
+                                    Object policy = XposedHelpers.getObjectField(
+                                            XposedHelpers.getObjectField(
+                                                    XposedHelpers.getObjectField(
+                                                    r, "mAtmService"), "mWindowManager"),
+                                            "mPolicy");
+                                    if ((Boolean) XposedHelpers.callMethod(
+                                            policy, "isDisplayFolded")) {
+                                        return;
+                                    }
+                                } catch (Throwable t) {
+                                    return;
+                                }
+                                try {
+                                    if ((Boolean) XposedHelpers.callMethod(
+                                            r, "inMiuiSizeCompatMode")) {
+                                        return; // size-compat letterbox keeps stock
+                                    }
+                                } catch (Throwable t) {
+                                    return; // missing API closes to "no rewrite"
+                                }
+                                param.args[0] = -1;
+                                setInfoOrientation(r, -1);
+                                ROT_REG.put(r, req);
+                                logRewrite("E1", pkg);
+                            } catch (Throwable t) {
+                                log("E1b failed: " + t);
+                            }
+                        }
+                    });
+            log("hook E1b ok: parallel-window write neutralization"
+                    + " (ActivityRecord.setOrientation)");
+        } catch (Throwable t) {
+            log("hook E1b FAILED: " + t);
+        }
+    }
+
+    /** E1b scope: MIUI parallel-window records only — live isEmbedded() or
+     *  the magic-window windowing mode (101, "miui-magic-windows"). Live
+     *  checks, not the ctor-final mMiuiEmbeddingEnabled flag: that flag is
+     *  sampled once at record creation from the dynamic embedding rule,
+     *  which is permanently false for self-adapt apps like WeChat. Split
+     *  screen, freeform and PIP fail both checks and keep stock; fullscreen
+     *  records fail both too (the engine's own write path owns them). */
+    private static boolean parallelWindow(Object r) {
+        try {
+            if ((Boolean) XposedHelpers.callMethod(r, "isEmbedded")) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            return (Integer) XposedHelpers.callMethod(r, "getWindowingMode") == 101;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
      * W1/W2(/W3) — make every registered app follow rotation on the unfolded
      * inner display. Gate order below is part of the spec (cheapest first):
      *  a) requested/current ∉ {UNSPECIFIED(-1), UNSET(-2), BEHIND(3)} — the
@@ -1198,6 +1384,7 @@ public class MainHook implements IXposedHookLoadPackage {
      */
     private static void hookSystemServer(XC_LoadPackage.LoadPackageParam lpp) {
         if (hookEngineMode(lpp)) {
+            hookEmbeddingRotation(lpp);
             log("system_server: ENGINE MODE active (W1-W5 superseded, not registered)");
             return;
         }
