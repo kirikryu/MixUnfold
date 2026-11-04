@@ -279,7 +279,12 @@ token 方案需在两侧各加一次反射取 token，无收益。
 - 总开关 `cetus_free_rot`：1=开（默认）。关闭后即使成员在弱表中也全部
   不改写（全机恢复原厂）。
 - 排除清单 `cetus_free_rot_exclude`：分号分隔包名。语义只有一种：清单内
-  的应用不旋转（维持原厂方向行为），其余全部跟随旋转。
+  的应用不旋转（维持原厂方向行为），其余全部跟随旋转。段按
+  `^[A-Za-z0-9_.]+$` 白名单过滤（公共 `ExcludeCodec` 统一解析/重组，
+  非法段丢弃并记 logcat）：该键对持 `WRITE_SETTINGS` 的第三方应用可写，
+  毒化存量值不得流入常驻 su shell 写路径；sink 侧另有
+  `RootWriter.shellQuote` POSIX 单引号转义兜底（su stdin 必经 shell
+  解析，参数数组无法消除该层）。
 
 懒加载红线：`handleLoadPackage("android")` 时 SettingsProvider 未就绪，
 首次 hook 调用（`freeRotOn()`）才读配置；读取失败保持未加载态、下次调用
@@ -469,3 +474,29 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
 空白页在横屏三页下短暂可见，进出一次编辑模式即由原厂清理（修正后
 15/16 在三页横屏不再误拦）。折叠态外屏任何情况都不增删页
 （`onInnerScreen` 门保障）。
+
+## 13. 排除清单注入加固与安全扫描 Seal 语义
+
+**根因**：`cetus_free_rot_exclude` 存于 `Settings.System`，该命名空间对
+持用户授予 `WRITE_SETTINGS` 的任意第三方应用可写（无 per-key ACL）。
+毒化存量值（含单引号的段）经排除选择器回读重组后，曾原样拼入常驻
+su shell 的单引号包裹——单引号可闭合逃逸，构成条件性 root shell
+命令注入链（触发需：恶意 app 已获 WRITE_SETTINGS + 用户在排除选择器
+toggle + 模块自身未持该权限走 su 回退）。
+
+**修复**（分支 `fix/exclude-shell-hardening`，commit `695a822`）：三层
+白名单（`ExcludeCodec` parse/join 统一 `^[A-Za-z0-9_.]+$`、非法段丢弃
+记 logcat；`SettingsWriter` String 写入前过滤）+ sink 侧
+`RootWriter.shellQuote` POSIX 单引号转义（su 非交互参数形式在主流实现
+仍过 `sh -c`，参数数组不能消除 shell 层，故在 sink 转义兜底）。回归：
+`tools/run-tests.sh`（15 项，含严格引号文法不可闭合校验）。
+
+**Seal 语义**（Mimosa 扫描，重要）：扫描产物目录中的 **Seal 派生自
+扫描元数据（含时间戳等实例信息），不是纯内容哈希——同一工作区重扫
+Seal 必变**。不得用 Seal 比对"代码内容是否变化"；内容比对用 commit
+hash。Seal 的用途仅是锁定单次扫描产物（findings / coverage / report）
+的完整性与可复核性。本修复链的对应关系：旧基线
+`scan-2026-11-04T13-06-48.048Z-2c5dbccc5a50`（Seal `3b73c756…f4e28d1`，
+confirmed 条件注入）→ 修复后
+`scan-2026-11-04T13-49-45.328Z-abf210abac64`（Seal `32700b0b…1232553f`，
+同 finding 静态残留 FP，见 commit message disposition）。

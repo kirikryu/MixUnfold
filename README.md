@@ -93,6 +93,9 @@ adb shell settings put system cetus_free_rot 1
 adb shell settings put system cetus_free_rot_exclude com.foo;com.bar
 ```
 
+排除清单段按包名字符集（`[A-Za-z0-9_.]`）白名单过滤，非法段丢弃并记
+logcat（TAG `CetusHomeHook`）。
+
 ## 常见问题
 
 **模块没生效？** 按顺序检查：
