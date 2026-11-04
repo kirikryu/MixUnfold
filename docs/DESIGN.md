@@ -518,4 +518,5 @@ Xposed 回调参数 `param.args[0]` 误认作进程 argv——注释行不构成
 `RootWriter.write` 的路径；`shellQuote` / `ExcludeCodec` 被修改或移除；
 发现其他动态派发真实调用链；`exec("su")` 后 stdin 写入逻辑变化且未
 转义。再次扫描命中同类 advisory 时按本节三元组（注释锚点 / 固定 sink /
-唯一入口）快速比对，回归防线见 `tools/run-tests.sh`。
+唯一入口）快速比对，回归防线见 `tools/run-tests.sh`。处置提交：
+`8961413`、`303702d`。
