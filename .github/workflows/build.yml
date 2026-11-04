@@ -123,12 +123,14 @@ jobs:
           BT="$ANDROID_HOME/build-tools/34.0.0"
           # 资产名带版本号（取自 AndroidManifest，与 tag 解耦；tag 不一致时
           # 以项目版本为准），避免 Release 页面跨版本出现多个同名 MixUnfold.apk。
-          # 注意：GitHub 上传资产名会把括号消毒成点（v1.8.2(23) 实际落盘
-          # v1.8.2.23.），SHA256SUMS.txt 里的本地名随之对不上、sha256sum -c
-          # 失败——模板必须只用 [A-Za-z0-9._-] 字符
+          # versionCode 用下划线接在 versionName 后（KernelSu 同款
+          # v{versionName}_{versionCode}-release 风格）：点连接的 v1.8.2.23
+          # 会被误读成四段版本号；括号 v1.8.2(23) 则被 GitHub 消毒成点（落盘
+          # v1.8.2.23.），SHA256SUMS.txt 里的本地名对不上、sha256sum -c 失败
+          # ——模板必须只用 [A-Za-z0-9._-] 字符
           VNAME="$(grep -o 'android:versionName="[^"]*"' app/AndroidManifest.xml | head -1 | cut -d'"' -f2)"
           VCODE="$(grep -o 'android:versionCode="[0-9]*"' app/AndroidManifest.xml | head -1 | cut -d'"' -f2)"
-          APK="releases/MixUnfold-v${VNAME}.${VCODE}-release.apk"
+          APK="releases/MixUnfold-v${VNAME}_${VCODE}-release.apk"
           mv releases/MixUnfold.apk "$APK"
           "$BT/apksigner" verify --print-certs "$APK"
           # 校验值只写入附件 SHA256SUMS.txt，不进 Release 正文

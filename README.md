@@ -34,7 +34,7 @@
 
 1. 设备已 root（Magisk / KernelSU）并安装 LSPosed
 2. 从 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases) 下载
-   APK（资产文件名带版本号，如 `MixUnfold-v1.8.2.23-release.apk`）并按
+   APK（资产文件名带版本号，如 `MixUnfold-v1.8.2_23-release.apk`）并按
    Release 附件 `SHA256SUMS.txt` 校验（详见
    [docs/faq.md](docs/faq.md#如何校验-apk-完整性)），然后安装：
 

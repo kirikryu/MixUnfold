@@ -4,6 +4,13 @@
 版本历史自 v1.6.2 起（更早无记录）；每个版本的完整改动见
 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)。
 
+## [Unreleased]
+
+- 变更：Release 资产 APK 文件名中 versionCode 改用下划线接在
+  versionName 后（如 `MixUnfold-v1.8.2_23-release.apk`，KernelSu 同款
+  `v{versionName}_{versionCode}` 风格）；此前点连接的 `v1.8.2.23` 易被
+  误读为四段版本号。本地 `./build.sh` 产物路径不变
+
 ## [1.8.2] - 2026-11-04
 
 - 修复：桌面偶发**一次多出两页空白页**（如 3 页内容变 5 页）——补页钩子
