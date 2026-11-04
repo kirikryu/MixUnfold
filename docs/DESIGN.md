@@ -521,5 +521,16 @@ Xposed 回调参数 `param.args[0]` 误认作进程 argv——注释行不构成
 唯一入口）快速比对，回归防线见 `tools/run-tests.sh`。处置提交：
 `8961413`、`303702d`。
 
+**行为级背书**（真机 cetus / MIUI V816.0.8.0，Magisk root + LSPosed，
+1.8.3/vc24 含加固 commit）：su 写入链已行为级验证——toggle 走 su 回退
+（WRITE_SETTINGS app-op 保持 default，排除直写路径），Magisk 授权库
+确认真实 su 授权，写入成功且存储值无碎引号，shellQuote 输出被真实
+su shell 原样消化，测试无残留。原扫描盲区③（静态边界/无运行时验证）
+就此闭环；盲区①（调用图 partial）②（依赖闭包未扫描）为静态侧固有
+边界，维持已记录状态。HEAD 复扫回执
+`scan-2026-11-04T15-42-44.425Z-e4f339cb4a2f`（Seal
+`bef4203b…04b38d3be`）：同一 findingId 持久复现、无新 finding，sink
+行号 29→36 随本次加固注释移动，印证锚点追踪 sink 本体。
+
 注：Mimosa 钩子不读取本节处置状态，同一 scan ID 的 advisory
 会在后续提交/CI 中重复提示，属预期行为；以本节判定为准，勿重复处置。
