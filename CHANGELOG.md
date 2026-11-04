@@ -4,7 +4,7 @@
 版本历史自 v1.6.2 起（更早无记录）；每个版本的完整改动见
 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)。
 
-## [Unreleased]
+## [1.8.3] - 2026-11-04
 
 - 安全修复：排除清单解析与 root shell 写入注入加固（Mimosa 深度扫描
   `scan-2026-11-04T13-06-48.048Z-2c5dbccc5a50`，medium「疑似跨文件污点」
