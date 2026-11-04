@@ -27,7 +27,7 @@
   桌面再返回，拖拽建页本身不触发；做一次上述操作空白页即补上
   （见 [FAQ](docs/faq.md#拖动图标新增页面后末尾空白页未立即出现)）
 - 变更：Release 资产 APK 文件名带版本号（如
-  `MixUnfold-v1.8.1(22)-release.apk`，取自 AndroidManifest 的
+  `MixUnfold-v1.8.2.23-release.apk`，取自 AndroidManifest 的
   versionName/versionCode），避免 Release 页面跨版本出现多个同名
   `MixUnfold.apk`；本地 `./build.sh` 产物路径不变
 
