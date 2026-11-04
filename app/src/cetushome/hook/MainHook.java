@@ -55,8 +55,13 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *     at process start and never re-evaluates it on rotation.
  *  10. Application.onCreate: register an in-process receiver so the module
  *     UI can cleanly restart the launcher.
- *  11/12. Even-page policy: pad the page count to a multiple of the current
- *     snap unit so flipping always lands on a complete pair/triple.
+ *  11/12. Even-page policy: keep the page count a multiple of the current
+ *     snap unit so flipping always lands on a complete pair/triple. On an
+ *     odd count a blank is appended only when the last page carries content;
+ *     a trailing EMPTY page is never touched (it may be stock's drag-to-edge
+ *     anticipation page or one the user just added). Re-entrancy-guarded and
+ *     deferred past stock reorder callbacks — an inline re-entry used to
+ *     read the pre-mutation count and pad twice in one event.
  *  13b. Launcher.onConfigurationChanged / onResume: re-run the orientation
  *     request decision. The launcher declares every config change (never
  *     recreates) and stock RotationHelper.onConfigurationChanged is an
@@ -123,6 +128,12 @@ public class MainHook implements IXposedHookLoadPackage {
     private static int cfgPadLand = 120;
     private static int cfgLandPages = 3;
     private static boolean cfgPadOpt;
+
+    // true while ensureEvenPages is mutating the workspace. insertNewScreen/
+    // removeScreen can re-enter this hook synchronously through stock's own
+    // reorderScreens callback; the re-entrant call would read the PRE-mutation
+    // screen count and pad a second time — the "two extra blank pages" bug.
+    private static boolean paddingLock;
 
     // SystemUI-side config: the keyguard switch, read once per SystemUI
     // process (default ON); disable + restart SystemUI restores stock.
@@ -262,6 +273,20 @@ public class MainHook implements IXposedHookLoadPackage {
             return live;
         }
         return unfoldedLarge(fallbackCtx);
+    }
+
+    /**
+     * Mode-decision context for the two-up vs three-page gates: the live
+     * Launcher activity's Resources track the display home is on, while the
+     * application context's configuration does not reliably follow fold
+     * transitions on this ROM (see evaluateRotatable / DESIGN.md §8) — its
+     * orientation lingers stale across a fold/unfold, which used to trip the
+     * even-page padding into three-page landscape. Falls back to the app
+     * context before the activity exists (process-start paths).
+     */
+    private static Context modeCtx(Context fallback) {
+        Context live = launcherContext();
+        return live != null ? live : fallback;
     }
 
     /** RotationHelper.getScreenOrientationByRequest: 2 → LOCKED(14),
@@ -491,7 +516,8 @@ public class MainHook implements IXposedHookLoadPackage {
                                 // the module does not touch margins at all
                                 if (cfgPadOpt && onInnerScreen(ctx)) {
                                     XposedHelpers.setStaticIntField(
-                                            dcCls, "sWorkspaceCellPaddingSide", bezelFor(ctx) / 2);
+                                            dcCls, "sWorkspaceCellPaddingSide",
+                                            bezelFor(modeCtx(ctx)) / 2);
                                 }
                             } catch (Throwable t) {
                                 log("padding hook failed: " + t);
@@ -531,8 +557,9 @@ public class MainHook implements IXposedHookLoadPackage {
                         if (!cfgPadOpt || !onInnerScreen(app)) {
                             return;
                         }
-                        int b = bezelFor(app);
-                        int modulo = isLandscape(app) ? cfgLandPages : 2;
+                        Context mode = modeCtx(app);
+                        int b = bezelFor(mode);
+                        int modulo = isLandscape(mode) ? cfgLandPages : 2;
                         int index = (int) XposedHelpers.callMethod(workspace, "indexOfChild", cellScreen);
                         XposedHelpers.setIntField(self, "mCellPaddingLeft",
                                 index % modulo == 0 ? b : 0);
@@ -569,7 +596,7 @@ public class MainHook implements IXposedHookLoadPackage {
                             return;
                         }
                         int screen = (Integer) XposedHelpers.callStaticMethod(dcCls, "getScreenWidth");
-                        boolean p3 = isLandscape(app) && cfgLandPages == 3;
+                        boolean p3 = isLandscape(modeCtx(app)) && cfgLandPages == 3;
                         int pages = p3 ? 3 : 2;
                         // Solve the page width against ScreenView's own snap
                         // formula: visibleRange = (content + gap) / (child + gap).
@@ -624,7 +651,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
                             try {
                                 Context ctx = (Context) param.args[0];
-                                if (!threePagesLandscape(ctx)) {
+                                if (!threePagesLandscape(modeCtx(ctx))) {
                                     return;
                                 }
                                 Object profile = XposedHelpers.getStaticObjectField(
@@ -712,21 +739,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     } catch (Throwable t) {
                         log("resume renotify FAILED: " + t);
                     }
-                    try {
-                        Object workspace = XposedHelpers.getObjectField(
-                                param.thisObject, "mWorkspace");
-                        if (workspace == null) {
-                            return;
-                        }
-                        View wv = (View) workspace;
-                        wv.post(new Runnable() {
-                            @Override public void run() {
-                                ensureEvenPages(workspace);
-                            }
-                        });
-                    } catch (Throwable t) {
-                        log("resume even-pages FAILED: " + t);
-                    }
+                    postEvenPagesCheck(param.thisObject);
                 }
             };
             XposedHelpers.findAndHookMethod(launcherCls, "onResume", resumeHook);
@@ -734,7 +747,20 @@ public class MainHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
-                            ensureEvenPages(param.thisObject);
+                            // deferred one loop turn: reorderScreens can fire
+                            // mid-way through a stock screen insert/remove (or
+                            // inside our own pad), and acting inline there
+                            // reads a lagged screen count — the double-pad
+                            final Object ws = param.thisObject;
+                            try {
+                                ((View) ws).post(new Runnable() {
+                                    @Override public void run() {
+                                        ensureEvenPages(ws);
+                                    }
+                                });
+                            } catch (Throwable t) {
+                                log("reorder even-pages FAILED: " + t);
+                            }
                         }
                     });
             log("hook 11/12 ok: even-page policy");
@@ -802,6 +828,11 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
                     renotifyRotationRequest(param.thisObject);
+                    // rotation/fold re-decides which mode's parity applies
+                    // (two-up pad vs three-page exempt) — the launcher
+                    // handles config changes in place, so without this the
+                    // check waits for the next resume
+                    postEvenPagesCheck(param.thisObject);
                 }
             };
             XposedHelpers.findAndHookMethod(launcherCls3, "onConfigurationChanged",
@@ -824,7 +855,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
                             try {
                                 Context app = appContext();
-                                if (!threePagesLandscape(app)) {
+                                if (!threePagesLandscape(modeCtx(app))) {
                                     return;
                                 }
                                 int idx = (Integer) param.args[0];
@@ -842,8 +873,10 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         // 15/16. even-page veto: block removal of the trailing EMPTY page
-        // when removing it would break the snap-unit parity. Non-empty
-        // pages (user content) always remain removable.
+        // when removing it would break the snap-unit parity — edit mode
+        // only (stock's edit-cycle pruning); normal-mode removals are part
+        // of stock's own flows (drag-to-edge page creation) and must pass.
+        // Non-empty pages (user content) always remain removable.
         try {
             final Class<?> workspaceCls2 = XposedHelpers.findClass(
                     "com.miui.home.launcher.Workspace", lpp.classLoader);
@@ -858,15 +891,22 @@ public class MainHook implements IXposedHookLoadPackage {
                         loadCfg(app);
                         // parity lock is a portrait two-up feature; landscape
                         // three-page mode pages freely (no veto, no parity)
-                        if (isLandscape(app) && cfgLandPages == 3) {
+                        if (isLandscape(modeCtx(app)) && cfgLandPages == 3) {
                             return;
                         }
                         Object ws = param.thisObject;
+                        // veto only stock's edit-cycle pruning. Removals in
+                        // normal mode belong to stock's own flows — the
+                        // drag-to-edge page creation re-manages the trailing
+                        // page, and blocking it kills the gesture outright
+                        if (!(Boolean) XposedHelpers.callMethod(ws, "isInNormalEditingMode")) {
+                            return;
+                        }
                         int count = (Integer) XposedHelpers.callMethod(ws, "getScreenCount");
                         if (count <= 1) {
                             return;
                         }
-                        int modulo = isLandscape(app) ? cfgLandPages : 2;
+                        int modulo = isLandscape(modeCtx(app)) ? cfgLandPages : 2;
                         int idx;
                         if (param.args[0] instanceof Long) {
                             idx = (Integer) XposedHelpers.callMethod(
@@ -1924,34 +1964,94 @@ public class MainHook implements IXposedHookLoadPackage {
         log(point + ": " + pkg + " -> follow system");
     }
 
-    /** Append empty pages until the count is a multiple of the snap unit.
-     *  Enforced for portrait two-up only; landscape three-page mode pages
-     *  freely (no parity lock), per design decision. */
+    /** Post a deferred parity check for the launcher's workspace. Posted so
+     *  it never runs mid-way through a stock screen operation or a config
+     *  change dispatch (see §12); no-op when the workspace does not exist. */
+    private static void postEvenPagesCheck(Object launcher) {
+        try {
+            final Object workspace = XposedHelpers.getObjectField(launcher, "mWorkspace");
+            if (workspace == null) {
+                return;
+            }
+            ((View) workspace).post(new Runnable() {
+                @Override public void run() {
+                    ensureEvenPages(workspace);
+                }
+            });
+        } catch (Throwable t) {
+            log("even-pages post FAILED: " + t);
+        }
+    }
+
+    /**
+     * Keep the page count a multiple of the snap unit (two-up = even): on an
+     * odd count whose last page carries CONTENT, append one blank. A trailing
+     * EMPTY page is never touched — it may be stock's drag-to-edge
+     * anticipation page (icon still in flight) or a page the user just added
+     * in edit mode; deleting it broke both flows (see §12). A lone trailing
+     * blank terminates the last pair harmlessly. Enforced for portrait
+     * two-up only; landscape three-page mode pages freely (no parity lock),
+     * per design decision.
+     *
+     * Re-entrancy guard: insertNewScreen can synchronously fire stock's
+     * reorderScreens, whose after-hook lands back here while the screen
+     * count still reads PRE-mutation — unguarded, that second call pads once
+     * more and the workspace gains TWO pages in one event.
+     */
     private static void ensureEvenPages(Object workspace) {
         try {
+            if (paddingLock) {
+                log("even-pages: re-entrant call skipped");
+                return;
+            }
             Context app = appContext();
             if (app == null || !onInnerScreen(app)) {
                 return;
             }
             loadCfg(app);
-            if (isLandscape(app) && cfgLandPages == 3) {
+            if (isLandscape(modeCtx(app)) && cfgLandPages == 3) {
                 return; // three-page mode: free paging, no parity lock
             }
             if ((boolean) XposedHelpers.callMethod(workspace, "isInNormalEditingMode")) {
                 return;
             }
-            int modulo = 2;
             int count = (int) XposedHelpers.callMethod(workspace, "getScreenCount");
-            int deficit = (modulo - count % modulo) % modulo;
-            for (int i = 0; i < deficit; i++) {
-                XposedHelpers.callMethod(workspace, "insertNewScreen", count + i);
+            if (count < 1 || count % 2 == 0) {
+                return;
             }
-            if (deficit > 0) {
-                log("even-pages: appended " + deficit + ", count " + count
-                        + " -> " + (count + deficit));
+            if (isScreenEmpty(workspace, count - 1)) {
+                log("even-pages: trailing empty page left as-is (count=" + count + ")");
+                return;
+            }
+            paddingLock = true;
+            try {
+                XposedHelpers.callMethod(workspace, "insertNewScreen", count);
+                log("even-pages: appended 1, count " + count + " -> " + (count + 1));
+                int now = (int) XposedHelpers.callMethod(workspace, "getScreenCount");
+                if (now % 2 == 1) {
+                    // never retry here — a lagged stock update is exactly how
+                    // the double-pad happened; the next trigger will fix parity
+                    log("even-pages: count still odd after fix (" + now + ")");
+                }
+            } finally {
+                paddingLock = false;
             }
         } catch (Throwable t) {
             log("ensureEvenPages failed: " + t);
+        }
+    }
+
+    /** Empty (no icons/widgets) CellScreen at the given index? Failures
+     *  conservatively report non-empty so callers fall back to appending. */
+    private static boolean isScreenEmpty(Object workspace, int idx) {
+        try {
+            Object cellScreen = XposedHelpers.callMethod(workspace, "getCellScreen", idx);
+            Object layout = cellScreen == null
+                    ? null : XposedHelpers.callMethod(cellScreen, "getCellLayout");
+            return layout != null
+                    && (Integer) XposedHelpers.callMethod(layout, "getChildCount") == 0;
+        } catch (Throwable t) {
+            return false;
         }
     }
 

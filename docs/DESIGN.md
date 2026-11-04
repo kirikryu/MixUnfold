@@ -53,11 +53,16 @@
 | 8 | `DeviceConfig.calcGridSize` | after | 三页模式下工作宽跟随 `屏宽/3`，并触发 `calculateCellSize` 重算 |
 | 9 | `DeviceConfig.getCellCountX` | before→实时列数 | 原生列数进程启动后缓存且旋转不重读；设置值进程内缓存一次，热路径零额外查询 |
 | 10 | `Application.onCreate` | after | 注册进程内重启广播接收器 |
-| 11/12 | `Launcher.onResume` / `Workspace.reorderScreens` | after | 偶数页策略：页数不足翻页单位时末尾补空白页（编辑模式跳过）；onResume 顺带触发 13b 的方向重发（去重，无开销） |
+| 11/12 | `Launcher.onResume` / `Launcher.onConfigurationChanged`（13b 复用路径）/ `Workspace.reorderScreens`（后两者 post 延迟执行） | after | 偶数页策略：页数为奇且末页**有内容**时补 1 页空白；末尾空白页**一律不动**（可能是原厂拖拽预备页或用户刚建的页，见第 12 节）；编辑模式跳过；重入锁防双补；onResume 顺带触发 13b 的方向重发（去重，无开销） |
 | 13 | `Launcher.checkDualScreen` | after | 三页模式下把每页页宽重新设为 `屏宽/3`：原生在每次配置变化后重断言页宽 `屏宽/2`，会覆盖钩子 6/7 的结果 |
-| 13b | `Launcher.onConfigurationChanged` | after | 折叠/展开切换后重跑方向请求决策（复刻 `RotationHelper.notifyChange` 并按 `mLastActivityFlags` 去重） |
+| 13b | `Launcher.onConfigurationChanged` | after | 折叠/展开切换后重跑方向请求决策（复刻 `RotationHelper.notifyChange` 并按 `mLastActivityFlags` 去重）；顺带 post 偶数页检查——Launcher 自消化 configChanges（旋转不重建、不触发 onResume），不挂这里的话旋转后奇偶约束的切换要等下次 resume 才生效 |
 | 14 | `FoldScreenIndexCalculator.obtainValidCurrentScreenIndex` | before | 三页模式下吸附目标改为 3 页组边界（原生硬编码 `% 2` 成对校准并强制末页回退一位）；非三页模式不动 |
-| 15/16 | `Workspace.deleteScreen(long)` / `removeScreen(int)` | before | 偶数页保护：移除末页会破坏翻页单位奇偶、且该页为空白页时否决移除（非空页始终放行）；仅展开态且「外侧边距优化」开启时生效，横屏三页模式不启用 |
+| 15/16 | `Workspace.deleteScreen(long)` / `removeScreen(int)` | before | 偶数页保护：**仅编辑模式**中，移除末页会破坏翻页单位奇偶、且该页为空白页时否决移除（非空页始终放行；普通模式的移除属于原厂自身流程——拖边建页会重建末尾页，拦截会弄死手势）；仅展开态且「外侧边距优化」开启时生效，横屏三页模式不启用 |
+
+表中钩子 4/5/6/7/8/11/12/14/15/16 的方向/模式判定统一经 `modeCtx()`
+取**实时桌面 Activity** 的 configuration（Activity 尚未创建的进程启动早期
+回退 app 上下文）。根因见第 12 节：app 上下文的方向在折叠切换后同样残留
+旧值，曾致横屏三页模式偶发误补空白页。
 
 另有 `Application.onCreate` after 中注册的进程内广播接收器
 （`cetushome.rotationunlock.RESTART`），供控制面板触发桌面重启。
@@ -407,3 +412,60 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
   miui-services.jar / miui-framework），`TaskSnapshot` 类在 system_server
   类加载器不可解析（W5 按名挂钩的原因）；引擎模式下 `systemContext()`
   必须用 lpp.classLoader（`actRecCls` 未解析，曾致 NPE 静默断链）。
+
+## 12. 偶数页误补的根因与修正
+
+**症状**（机主实测）：桌面偶发**一次多出两页空白页**（如 3 页内容变
+5 页）；另曾观察到横屏三页模式下补出 1 页空白页、且原厂编辑模式清理
+不掉；第三轮实测又发现普通模式拖图标到末页右缘**不弹新页**（编辑模式
+里同样手势才可用），且编辑模式刚添加的空页随后被模块删掉。
+
+**根因一（双补，"+2 页"的主因）**：补页入口 `ensureEvenPages` 单次调用
+最多补 1 页（modulo=2，deficit≤1），"+2"必然是两次调用都读到了补页前
+的旧页数。`insertNewScreen`/`removeScreen` 会触发原厂自身的
+`reorderScreens` 回调，其 after 钩子**同步内联重入** `ensureEvenPages`，
+此刻新页尚未计入 `getScreenCount` → 仍读到奇数 → 再补一页 → 一次事件
++2 页。是否重入取决于原厂内部路径，故"偶发"。
+
+**根因二（过期方向，"+1 页"）**：三页豁免门原以
+`isLandscape(appContext())` 判定"两页配对补齐还是三页免补"，而 app
+上下文的 configuration 在折叠切换后不随折叠可靠更新（第 8 节已实证的
+同一过期源；v1.6.4 修外屏误旋转时内屏判定 `onInnerScreen` 已迁移到
+实时桌面 Activity，方向判定漏迁）。展开到横屏后残留竖屏方向：三页
+豁免门失效 → 3 页被判作竖屏两页模式的奇数页 → 误补 1 页；同一误判还
+令 15/16 的否决门在真三页横屏下错误生效，拦掉原厂对末尾空白页的清理。
+
+**修正**（钩子 11/12）：
+
+1. **重入锁**：`paddingLock` 覆盖增/删执行期，重入调用直接跳过并记
+   日志（`even-pages: re-entrant call skipped`）；
+2. **`reorderScreens` 触发改为 post 延迟**：不在原厂增/删页操作中途
+   读页数（`onResume` 路径本就 post）；
+3. **触发点补全（`onConfigurationChanged`）**：Launcher 自消化全部
+   configChanges（旋转不重建、不触发 onResume），旋转/折叠切换后
+   无人重估奇偶——"横屏变奇数页 → 转竖屏"后不补页、要等锁屏解锁。
+   13b 路径复用 `postEvenPagesCheck` 补齐；
+4. **奇数且末页有内容才补页；末尾空白页一律不动**。曾实现过"奇数 +
+   末尾空白 → 删空白页"的自愈，实机日志证明它会误删两类合法页：原厂
+   拖边建页先建好的预备页（图标尚在拖拽中、页面为空，日志
+   `dropped trailing empty page, count 9 -> 8` 连续命中每次手势重试）、
+   用户在编辑模式刚添加的空页。末尾空白保留时奇数页不处理——末位
+   空白独立收尾最后一对，内容页配对不受影响；
+5. **否决门（15/16）收窄到编辑模式**：实机日志（`vetoed removal …
+   count=8`）证明普通模式拖边建页流程内部会先移除末尾页再重建，无
+   编辑门限的否决把该流程拦死（拖边建页失效）。原设计要防的"编辑
+   进出时原厂清页"仍被覆盖；若退出编辑的清页发生在编辑标志清除
+   之后，空白页会被原厂清掉，由下一个触发点按第 4 条补回（可接受
+   的抖动）；
+6. **方向判定统一走 `modeCtx()`**（实时 Launcher Activity 优先、app
+   上下文兜底）：钩子 4/5/6/7/8/11/12/14/15/16 共 9 处，消除根因二。
+   `onInnerScreen` 内部与钩子 13（`param.thisObject` 即实时 Launcher）
+   本就正确，不动。
+
+**残留既定行为**：竖屏两页模式下内容页为奇数、且末页有内容时仍合法
+补 1 页配对（钩子 11/12 的设计目标）。触发点覆盖 resume / 配置变化
+（旋转、折叠切换）/ reorder 三类；奇数页若在免补模式（横屏三页）下
+产生，转入两页模式的旋转当拍即触发补页检查（13b 复用路径）。该配对
+空白页在横屏三页下短暂可见，进出一次编辑模式即由原厂清理（修正后
+15/16 在三页横屏不再误拦）。折叠态外屏任何情况都不增删页
+（`onInnerScreen` 门保障）。
