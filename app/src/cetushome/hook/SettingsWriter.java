@@ -26,7 +26,9 @@ final class SettingsWriter {
         // This key is attacker-controllable storage (any app with the
         // WRITE_SETTINGS app-op can write it), so persist only package-name-
         // shaped segments — a poisoned value must never be stored by us, and
-        // never reach the su-shell line below.
+        // never reach the su-shell line below. This is the only String path
+        // into RootWriter's su shell; the second layer is settingShellLine's
+        // shellQuote — either one alone would stop the poisoned value.
         String safe = ExcludeCodec.join(ExcludeCodec.parse(value));
         try {
             if (Settings.System.canWrite(ctx)) {

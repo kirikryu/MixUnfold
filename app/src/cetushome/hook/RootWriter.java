@@ -27,6 +27,12 @@ final class RootWriter {
         return "'" + s.replace("'", "'\\''") + "'";
     }
 
+    /** The module's one and only shell sink: reached solely from
+     *  SettingsWriter (both overloads), never directly from a hook callback
+     *  (static advisors keep flagging this line — see DESIGN.md §13
+     *  advisory disposition). Contract: every variable string inside cmds
+     *  has already crossed ExcludeCodec's whitelist and shellQuote;
+     *  regression-pinned in tools/run-tests.sh. */
     static synchronized boolean write(String cmds) {
         for (int attempt = 0; attempt < 2; attempt++) {
             try {

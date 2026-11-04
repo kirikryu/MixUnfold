@@ -4,11 +4,13 @@ import java.util.Arrays;
 import java.util.TreeSet;
 
 /** JVM regression tests for the exclude-list / root-shell hardening
- *  (Mimosa scan scan-2026-11-04T13-06-48.048Z-2c5dbccc5a50). Defensive
- *  only: asserts poisoning is dropped/escaped, never how to exploit.
- *  No shell is ever executed — shellQuote is verified by a strict POSIX
- *  single-quote grammar parser (shellUnquote) instead. Run via
- *  tools/run-tests.sh. */
+ *  (Mimosa scan scan-2026-11-04T13-06-48.048Z-2c5dbccc5a50; the
+ *  newline/hostile-key cases pin the defenses cited when closing its
+ *  FP residual, scan-2026-11-04T14-48-57.059Z-e3b688e03b1d — see
+ *  DESIGN.md §13). Defensive only: asserts poisoning is dropped/
+ *  escaped, never how to exploit. No shell is ever executed —
+ *  shellQuote is verified by a strict POSIX single-quote grammar
+ *  parser (shellUnquote) instead. Run via tools/run-tests.sh. */
 public final class ExcludeHardeningTest {
 
     private static int failures;
@@ -47,6 +49,18 @@ public final class ExcludeHardeningTest {
                 "'a'\\'';id;echo '\\'''", RootWriter.shellQuote(payload));
         check("shellQuote empty string",
                 "''", RootWriter.shellQuote(""));
+        // newline would be a command separator in the su shell's stdin
+        // stream; inside shellQuote's single quotes it stays one literal
+        // word of the same argument
+        check("shellQuote keeps newline literal",
+                "'ok.app\nid'", RootWriter.shellQuote("ok.app\nid"));
+        check("quote grammar decodes newline payload back",
+                "ok.app\nid", shellUnquote(RootWriter.shellQuote("ok.app\nid")));
+        // keys are hardcoded constants at every real call site; this pins
+        // the quoting layer for both slots regardless
+        check("hostile key quoted in shell line",
+                "settings put system 'a'\\'';id' 'ok.app'\n",
+                SettingsWriter.settingShellLine("a';id", "ok.app"));
 
         // --- end to end: su-shell line for a poisoned stored value -------
         String line = SettingsWriter.settingShellLine("cetus_free_rot_exclude",
