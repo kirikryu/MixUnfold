@@ -4,7 +4,7 @@
 版本历史自 v1.6.2 起（更早无记录）；每个版本的完整改动见
 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)。
 
-## [Unreleased]
+## [1.8.2] - 2026-11-04
 
 - 修复：桌面偶发**一次多出两页空白页**（如 3 页内容变 5 页）——补页钩子
   的 `insertNewScreen` 会触发原厂 `reorderScreens` 回调并同步内联重入
