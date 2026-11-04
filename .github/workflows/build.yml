@@ -121,7 +121,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           BT="$ANDROID_HOME/build-tools/34.0.0"
-          APK=releases/MixUnfold.apk
+          # 资产名带版本号（取自 AndroidManifest，与 tag 解耦；tag 不一致时
+          # 以项目版本为准），避免 Release 页面跨版本出现多个同名 MixUnfold.apk
+          VNAME="$(grep -o 'android:versionName="[^"]*"' app/AndroidManifest.xml | head -1 | cut -d'"' -f2)"
+          VCODE="$(grep -o 'android:versionCode="[0-9]*"' app/AndroidManifest.xml | head -1 | cut -d'"' -f2)"
+          APK="releases/MixUnfold-v${VNAME}(${VCODE})-release.apk"
+          mv releases/MixUnfold.apk "$APK"
           "$BT/apksigner" verify --print-certs "$APK"
           # 校验值只写入附件 SHA256SUMS.txt，不进 Release 正文
           APK_SHA="$(sha256sum "$APK" | cut -d' ' -f1)"

@@ -4,6 +4,13 @@
 版本历史自 v1.6.2 起（更早无记录）；每个版本的完整改动见
 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)。
 
+## [Unreleased]
+
+- 变更：Release 资产 APK 文件名带版本号（如
+  `MixUnfold-v1.8.1(22)-release.apk`，取自 AndroidManifest 的
+  versionName/versionCode），避免 Release 页面跨版本出现多个同名
+  `MixUnfold.apk`；本地 `./build.sh` 产物路径不变
+
 ## [1.8.1] - 2026-11-02
 
 - 修复：MIUI 平行窗口应用内运行期方向请求（公众号文章页、详情页等
