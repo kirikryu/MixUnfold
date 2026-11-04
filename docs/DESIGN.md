@@ -279,7 +279,12 @@ token 方案需在两侧各加一次反射取 token，无收益。
 - 总开关 `cetus_free_rot`：1=开（默认）。关闭后即使成员在弱表中也全部
   不改写（全机恢复原厂）。
 - 排除清单 `cetus_free_rot_exclude`：分号分隔包名。语义只有一种：清单内
-  的应用不旋转（维持原厂方向行为），其余全部跟随旋转。
+  的应用不旋转（维持原厂方向行为），其余全部跟随旋转。段按
+  `^[A-Za-z0-9_.]+$` 白名单过滤（公共 `ExcludeCodec` 统一解析/重组，
+  非法段丢弃并记 logcat）：该键对持 `WRITE_SETTINGS` 的第三方应用可写，
+  毒化存量值不得流入常驻 su shell 写路径；sink 侧另有
+  `RootWriter.shellQuote` POSIX 单引号转义兜底（su stdin 必经 shell
+  解析，参数数组无法消除该层）。
 
 懒加载红线：`handleLoadPackage("android")` 时 SettingsProvider 未就绪，
 首次 hook 调用（`freeRotOn()`）才读配置；读取失败保持未加载态、下次调用

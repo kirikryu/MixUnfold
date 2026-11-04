@@ -62,7 +62,7 @@ public class AppPickerActivity extends Activity {
 
         String raw = Settings.System.getString(getContentResolver(),
                 MainHook.KEY_ROT_EXCLUDE);
-        excluded.addAll(parseExclude(raw));
+        excluded.addAll(ExcludeCodec.parse(raw));
 
         apps = new AppAdapter();
 
@@ -281,7 +281,7 @@ public class AppPickerActivity extends Activity {
      *  and only surface a mismatch for the newest write. */
     private void verifyWrite(int seq, String value) {
         boolean direct = SettingsWriter.put(this, MainHook.KEY_ROT_EXCLUDE, value);
-        HashSet<String> want = parseExclude(value);
+        HashSet<String> want = ExcludeCodec.parse(value);
         HashSet<String> stored = settleRead(want, direct);
         if (stored != null && !stored.equals(want) && seq == writeSeq) {
             SettingsWriter.put(this, MainHook.KEY_ROT_EXCLUDE, value);
@@ -329,36 +329,14 @@ public class AppPickerActivity extends Activity {
     }
 
     private String joinExcluded() {
-        StringBuilder sb = new StringBuilder();
-        boolean first = true;
-        for (String p : excluded) {
-            if (!first) {
-                sb.append(';');
-            }
-            sb.append(p);
-            first = false;
-        }
-        return sb.toString();
-    }
-
-    /** Exclusion key parser shared with MainHook's readExclude: semicolon-
-     *  separated package names, blank segments dropped. */
-    private static HashSet<String> parseExclude(String raw) {
-        HashSet<String> set = new HashSet<String>();
-        if (raw != null) {
-            for (String s : raw.split(";")) {
-                s = s.trim();
-                if (!s.isEmpty()) {
-                    set.add(s);
-                }
-            }
-        }
-        return set;
+        // re-validates every segment (ExcludeCodec.join): never trusts the
+        // set, which merges PackageManager names with Settings read-backs
+        return ExcludeCodec.join(excluded);
     }
 
     private HashSet<String> readStoredExclude() {
         try {
-            return parseExclude(Settings.System.getString(getContentResolver(),
+            return ExcludeCodec.parse(Settings.System.getString(getContentResolver(),
                     MainHook.KEY_ROT_EXCLUDE));
         } catch (Throwable ignored) {
             return new HashSet<String>();

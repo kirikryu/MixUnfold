@@ -6,6 +6,18 @@
 
 ## [Unreleased]
 
+- 安全修复：排除清单解析与 root shell 写入注入加固（Mimosa 深度扫描
+  `scan-2026-11-04T13-06-48.048Z-2c5dbccc5a50`，medium「疑似跨文件污点」
+  经专家复核裁决为 confirmed 条件命令注入链）：`Settings.System` 键对持
+  `WRITE_SETTINGS` 的第三方应用可写，毒化的 `cetus_free_rot_exclude`
+  存量值经排除选择器回读重组后曾原样拼入常驻 su shell 的单引号包裹，
+  单引号可闭合逃逸执行任意命令。现 parse / join / 写入三层均按
+  `^[A-Za-z0-9_.]+$` 白名单过滤非法段（丢弃并记 logcat；新增公共
+  `ExcludeCodec`，AppPickerActivity 与 MainHook.readExclude 统一接入）；
+  su shell 命令行的键值统一经 POSIX 单引号转义（`RootWriter.shellQuote`），
+  传入字符串无法闭合引号（su 的 stdin 必经 shell 解析，参数数组无法消除
+  该层，故在 sink 转义兜底）。新增 `tools/run-tests.sh` JVM 回归测试
+  （合法包名保留、注入段丢弃、引号文法不可闭合校验，15 项全过）
 - 变更：Release 资产 APK 文件名中 versionCode 改用下划线接在
   versionName 后（如 `MixUnfold-v1.8.2_23-release.apk`，KernelSu 同款
   `v{versionName}_{versionCode}` 风格）；此前点连接的 `v1.8.2.23` 易被

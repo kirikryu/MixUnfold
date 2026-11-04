@@ -1824,23 +1824,17 @@ public class MainHook implements IXposedHookLoadPackage {
         log("free-rot config loaded: on=" + cfgFreeRot + " excluded=" + cfgExclude);
     }
 
-    /** Exclusion list parser: semicolon-separated package names, blank
-     *  segments dropped. Only semantic: on the list = keep stock behavior. */
+    /** Exclusion list reader via the shared ExcludeCodec (whitelist + drop
+     *  logging): Settings-stored values are untrusted — illegal segments
+     *  never reach match logic, let alone a later shell sink. Only
+     *  semantic: on the list = keep stock behavior. */
     private static HashSet<String> readExclude(Context ctx) {
-        HashSet<String> set = new HashSet<String>();
         try {
-            String raw = Settings.System.getString(ctx.getContentResolver(), KEY_ROT_EXCLUDE);
-            if (raw != null) {
-                for (String s : raw.split(";")) {
-                    s = s.trim();
-                    if (!s.isEmpty()) {
-                        set.add(s);
-                    }
-                }
-            }
+            return ExcludeCodec.parse(
+                    Settings.System.getString(ctx.getContentResolver(), KEY_ROT_EXCLUDE));
         } catch (Throwable ignored) {
+            return new HashSet<String>();
         }
-        return set;
     }
 
     /** The system_server Context whose resolver serves settings. */
