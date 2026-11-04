@@ -500,3 +500,22 @@ hash。Seal 的用途仅是锁定单次扫描产物（findings / coverage / repo
 confirmed 条件注入）→ 修复后
 `scan-2026-11-04T13-49-45.328Z-abf210abac64`（Seal `32700b0b…1232553f`，
 同 finding 静态残留 FP，见 commit message disposition）。
+
+**Advisory 处置**（误报关闭，2026-11-04）：deep 扫描
+`scan-2026-11-04T14-48-57.059Z-e3b688e03b1d`（Seal
+`a530b4c5…c24a5179`）报告唯一 finding——MEDIUM 跨文件污点
+`MainHook.java:1258 → RootWriter.java:29`（"命令行参数 → Runtime/
+ProcessBuilder 命令执行"），与上段修复后扫描的静态残留同族。人工复核
+判定误报/不可利用：(1) 锚点行位于 E1 的 Javadoc 注释内，污点源头是把
+Xposed 回调参数 `param.args[0]` 误认作进程 argv——注释行不构成运行时
+数据流；(2) 唯一 sink 为 `RootWriter.write` 内固定 `exec("su")`，无变量
+拼接（finding 报告的 sink 行 29 实为方法签名行，exec 在 34，行号仅近似
+锚定）；(3) 全仓库仅 `SettingsWriter` 调用 `RootWriter.write`——int
+重载 value 为 `int` 类型安全，String 重载经 `ExcludeCodec` 白名单 +
+`shellQuote` 转义双层防线。该次扫描 completeness partial（动态派发调用
+图缺口），不构成清白证明，但上述证据链不足以维持漏洞定性，不阻塞
+发布。**复核触发条件**：新增绕过 `SettingsWriter` 直接调用
+`RootWriter.write` 的路径；`shellQuote` / `ExcludeCodec` 被修改或移除；
+发现其他动态派发真实调用链；`exec("su")` 后 stdin 写入逻辑变化且未
+转义。再次扫描命中同类 advisory 时按本节三元组（注释锚点 / 固定 sink /
+唯一入口）快速比对，回归防线见 `tools/run-tests.sh`。
