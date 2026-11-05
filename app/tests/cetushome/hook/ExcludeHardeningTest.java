@@ -3,14 +3,13 @@ package cetushome.hook;
 import java.util.Arrays;
 import java.util.TreeSet;
 
-/** JVM regression tests for the exclude-list / root-shell hardening
- *  (Mimosa scan scan-2026-11-04T13-06-48.048Z-2c5dbccc5a50; the
- *  newline/hostile-key cases pin the defenses cited when closing its
- *  FP residual, scan-2026-11-04T14-48-57.059Z-e3b688e03b1d — see
- *  DESIGN.md §13). Defensive only: asserts poisoning is dropped/
- *  escaped, never how to exploit. No shell is ever executed —
- *  shellQuote is verified by a strict POSIX single-quote grammar
- *  parser (shellUnquote) instead. Run via tools/run-tests.sh. */
+/** JVM regression tests for the exclusion-list input validation that
+ *  survived the 1.9.0 storage migration. The original cases were added with
+ *  the Settings.System/su hardening (Mimosa scan
+ *  scan-2026-11-04T13-06-48.048Z-2c5dbccc5a50); the shell layers are gone,
+ *  but the whitelist is kept as defense in depth for values arriving from the
+ *  legacy migration or a restored backup. Defensive only: asserts poisoning
+ *  is dropped, never how to exploit. Run via tools/run-tests.sh. */
 public final class ExcludeHardeningTest {
 
     private static int failures;
@@ -24,6 +23,8 @@ public final class ExcludeHardeningTest {
                 new TreeSet<String>(ExcludeCodec.parse("com.example.app;a_b.c1")));
         check("trim and blank segments dropped",
                 set("a"), new TreeSet<String>(ExcludeCodec.parse(" ; a ;")));
+        check("null raw parses to empty set",
+                0, ExcludeCodec.parse(null).size());
 
         // --- parse: quote-bearing segments dropped and logged ------------
         // "id" between the semicolons is legal-shaped and correctly survives
@@ -43,93 +44,24 @@ public final class ExcludeHardeningTest {
                 "ok.app", ExcludeCodec.join(Arrays.asList("ok.app", "", null)));
         check("join output never contains a quote",
                 true, ExcludeCodec.join(Arrays.asList("a'", "b`c", "d$e")).indexOf('\'') < 0);
+        check("join empty collection is empty string",
+                "", ExcludeCodec.join(new TreeSet<String>()));
 
-        // --- RootWriter.shellQuote: exact POSIX single-quote escaping ----
-        check("shellQuote exact escaping",
-                "'a'\\'';id;echo '\\'''", RootWriter.shellQuote(payload));
-        check("shellQuote empty string",
-                "''", RootWriter.shellQuote(""));
-        // newline would be a command separator in the su shell's stdin
-        // stream; inside shellQuote's single quotes it stays one literal
-        // word of the same argument
-        check("shellQuote keeps newline literal",
-                "'ok.app\nid'", RootWriter.shellQuote("ok.app\nid"));
-        check("quote grammar decodes newline payload back",
-                "ok.app\nid", shellUnquote(RootWriter.shellQuote("ok.app\nid")));
-        // keys are hardcoded constants at every real call site; this pins
-        // the quoting layer for both slots regardless
-        check("hostile key quoted in shell line",
-                "settings put system 'a'\\'';id' 'ok.app'\n",
-                SettingsWriter.settingShellLine("a';id", "ok.app"));
-
-        // --- end to end: su-shell line for a poisoned stored value -------
-        String line = SettingsWriter.settingShellLine("cetus_free_rot_exclude",
-                ExcludeCodec.join(ExcludeCodec.parse(payload)));
-        check("shell line neutralized",
-                "settings put system 'cetus_free_rot_exclude' 'id'\n", line);
-
-        // --- shellQuote cannot be closed: a strict parser of the POSIX
-        //     single-quote grammar must decode the output back to the exact
-        //     input, and any quote closure without the '\'' splice is a
-        //     structural failure (that splice is the only legal way out) --
-        check("quote grammar decodes payload back",
-                payload, shellUnquote(RootWriter.shellQuote(payload)));
-        check("quote grammar holds for clean values",
-                "ok.app", shellUnquote(RootWriter.shellQuote("ok.app")));
-        check("quote grammar holds for empty value",
-                "", shellUnquote(RootWriter.shellQuote("")));
-        boolean rejected = false;
-        try {
-            shellUnquote("'a';id");            // closed quote, no splice
-        } catch (AssertionError expected) {
-            rejected = true;
-        }
-        check("unescaped quote closure rejected by grammar",
-                true, rejected);
+        // --- segment grammar ---------------------------------------------
+        check("isLegalSegment accepts package characters",
+                true, ExcludeCodec.isLegalSegment("a_b.c1"));
+        check("isLegalSegment rejects quote",
+                false, ExcludeCodec.isLegalSegment("a'b"));
+        check("isLegalSegment rejects semicolon",
+                false, ExcludeCodec.isLegalSegment("a;b"));
+        check("isLegalSegment rejects null",
+                false, ExcludeCodec.isLegalSegment(null));
 
         if (failures > 0) {
             System.out.println(failures + " FAILURE(S)");
             System.exit(1);
         }
         System.out.println("ALL PASS");
-    }
-
-    /** Strict parser for what RootWriter.shellQuote emits: quoted runs
-     *  spliced by '\''. Decodes the single word a POSIX shell would pass;
-     *  throws on any text outside quotes or any closure that is not the
-     *  escaped splice — i.e. on anything closable. */
-    private static String shellUnquote(String q) {
-        StringBuilder out = new StringBuilder();
-        int i = 0;
-        int n = q.length();
-        while (i < n) {
-            if (q.charAt(i) != '\'') {
-                throw new AssertionError("unquoted text at " + i + ": " + q);
-            }
-            i++;                               // opening '
-            while (true) {
-                while (i < n && q.charAt(i) != '\'') {
-                    out.append(q.charAt(i));
-                    i++;
-                }
-                if (i >= n) {
-                    throw new AssertionError("unterminated quote: " + q);
-                }
-                i++;                           // closing '
-                if (i >= n) {
-                    break;                     // clean end of string
-                }
-                // mid-string closure must be the '\'' splice; its third
-                // quote reopens, so literals continue in the same loop
-                if (q.charAt(i) != '\\' || i + 2 >= n
-                        || q.charAt(i + 1) != '\'' || q.charAt(i + 2) != '\'') {
-                    throw new AssertionError("unescaped quote closure at " + i + ": " + q);
-                }
-                out.append('\'');
-                i += 3;
-            }
-        }
-        return out.toString();
     }
 
     private static TreeSet<String> set(String... items) {

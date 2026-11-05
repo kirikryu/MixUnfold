@@ -56,8 +56,8 @@ mkdir -p "$OUT_DIR/shim" "$OUT_DIR/main" "$OUT_DIR/t"
 
 "$JDK_BIN/javac" --release 8 -encoding UTF-8 -cp "$AJ" -d "$OUT_DIR/main" \
     app/src/cetushome/hook/ExcludeCodec.java \
-    app/src/cetushome/hook/RootWriter.java \
-    app/src/cetushome/hook/SettingsWriter.java \
+    app/src/cetushome/hook/PrefsKeys.java \
+    app/src/cetushome/hook/PrefsMigration.java \
     app/src/cetushome/hook/WidgetSpan.java
 
 # bash 3.2 (stock macOS /bin/bash) has no mapfile — append in a loop
