@@ -534,6 +534,14 @@ su shell 原样消化，测试无残留。原扫描盲区③（静态边界/无�
 `scan-2026-11-04T15-42-44.425Z-e4f339cb4a2f`（Seal
 `bef4203b…04b38d3be`）：同一 findingId 持久复现、无新 finding，sink
 行号 29→36 随本次加固注释移动，印证锚点追踪 sink 本体。
+1.8.4 发布前全量复扫回执 `scan-2026-11-05T04-20-12.541Z-cbfbb80715d8`
+（Seal `sha256:16dea688…967865a`，deep）：0 high / 1 medium / 0 low /
+0 business-logic，唯一 finding 的 findingId 与昨日 HEAD 扫描**逐位
+相同**（`finding:5ed4ef6ce64178f2ca8f9225`，sink 仍为 RootWriter.java:36
+固定 `exec("su")`），锚点随钩子 17-19 的插入漂移 1258→1421（仍在 E1
+Javadoc 注释内）——findingId 为内容哈希派生身份，逐位相同即同源；
+钩子 17-19 与 run-tests.sh 加固零新增 finding，本节判定继续有效
+（Seal 跨次扫描不可比，见上文 Seal 语义）。
 
 注：Mimosa 钩子不读取本节处置状态，同一 scan ID 的 advisory
 会在后续提交/CI 中重复提示，属预期行为；以本节判定为准，勿重复处置。
