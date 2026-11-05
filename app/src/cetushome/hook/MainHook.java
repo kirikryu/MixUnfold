@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.database.ContentObserver;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -68,6 +69,30 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *     empty stub — so a fold transition never re-issued the request and the
  *     sensor-following request from the unfolded session stayed active on
  *     the cover screen (outer-screen rotation, fixed by 1b + 13b together).
+ *  17. ItemInfo.load: runtime widget shrink. Rows authored for the stock
+ *      4-column grid (a full-width 2x4 widget, or anything at cellX>=1)
+ *      overflow the narrowed grid: CellLayout.updateCellOccupiedMarks
+ *      indexes mOccupiedCell by cellX..cellX+spanX with no bounds guard,
+ *      the AIOOBE is swallowed by Launcher.bindAppWidget ("server side
+ *      exception,ignore it") and the item simply never shows. Clamp
+ *      spanX/cellX on the parsed ItemInfo instead — DB untouched, so
+ *      switching the column count back restores the original sizes.
+ *  18. MIUIWidgetCompat.createItemInfo: fit picker-authored spans. The MIUI
+ *      widget picker sends sizes authored for the stock grid; stock only
+ *      trusts them when the live count equals the minimum ("narrowest
+ *      grid", where the picker is assumed to size for that grid). This
+ *      module pins Min==live==setting, so a 4-column spanX=4 (calendar
+ *      agenda and friends) reached acceptDrop on a 3-column grid and the
+ *      drop was refused outright — the widget could not be added at all.
+ *      Clamp the created info's spanX before any consumer sees it.
+ *  19. MIUIWidgetReplaceHandler.canReplace: same authored-span mismatch on
+ *      the replace path, one gate earlier. "更换小部件" requires the old
+ *      widget's live spanX to cover the new widget's authored spanX; under
+ *      a narrowed grid the old one displays at the fitted width (3) while
+ *      the bundle still says 4, the check fails and the replace silently
+ *      aborts before anything is removed. Re-judge with the new span
+ *      fitted to the live grid; bundles that already fit pass through
+ *      untouched (stock verdict bit-for-bit).
  *
  * A second target is hooked in its own process (com.android.systemui):
  * S1. NotificationShadeWindowControllerImpl.adjustScreenOrientation after —
@@ -940,6 +965,144 @@ public class MainHook implements IXposedHookLoadPackage {
             log("hook 15/16 ok: even-page removal veto");
         } catch (Throwable t) {
             log("hook 15/16 FAILED: " + t);
+        }
+
+        // 17. runtime widget shrink (see class doc, item 17). ItemInfo.load
+        // is the single parse point every workspace item type funnels
+        // through (ShortcutInfo/FolderInfo/LauncherAppWidgetInfo/GadgetInfo/
+        // MaMlWidgetInfo.load all super-call it), so one after-hook covers
+        // MIUI gadgets and maml widgets too — the paths stock's own
+        // reCalculateSpan migration never touches.
+        try {
+            final Class<?> itemInfoCls = XposedHelpers.findClass(
+                    "com.miui.home.launcher.ItemInfo", lpp.classLoader);
+            XposedHelpers.findAndHookMethod(itemInfoCls, "load",
+                    Context.class, Cursor.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                Object info = param.thisObject;
+                                // desktop items only — folder contents lay
+                                // out on their own grid and are 1x1 anyway
+                                if (XposedHelpers.getLongField(info, "container") != -100L) {
+                                    return;
+                                }
+                                Context app = appContext();
+                                if (app == null) {
+                                    return;
+                                }
+                                loadCfg(app);
+                                int countX = cfgColumns;
+                                int spanX = XposedHelpers.getIntField(info, "spanX");
+                                int cellX = XposedHelpers.getIntField(info, "cellX");
+                                if (!WidgetSpan.needsFit(spanX, cellX, countX)) {
+                                    return;
+                                }
+                                int newSpan = WidgetSpan.fitSpanX(spanX, countX);
+                                int newCell = WidgetSpan.fitCellX(cellX, newSpan, countX);
+                                XposedHelpers.setIntField(info, "spanX", newSpan);
+                                XposedHelpers.setIntField(info, "cellX", newCell);
+                                log("widget-fit: spanX " + spanX + "->" + newSpan
+                                        + " cellX " + cellX + "->" + newCell
+                                        + " type=" + XposedHelpers.getIntField(info, "itemType")
+                                        + " id=" + XposedHelpers.getLongField(info, "id"));
+                            } catch (Throwable t) {
+                                log("widget-fit hook failed: " + t);
+                            }
+                        }
+                    });
+            log("hook 17 ok: ItemInfo.load widget fit");
+        } catch (Throwable t) {
+            log("hook 17 FAILED: " + t);
+        }
+
+        // 18. fit picker-authored spans (see class doc, item 18). One
+        // choke point for every MIUI-widget add: the picker drag-out, its
+        // prepare step and the on-desktop replace flow all build the item
+        // here. The maml branch already fits its spans internally
+        // (MaMlWidgetInfo.calculateSpan); the appwidget branch overwrites
+        // them with the raw bundle values under this module's
+        // Min==live pinning — clamp whatever comes out either way.
+        try {
+            final Class<?> compatCls = XposedHelpers.findClass(
+                    "com.miui.home.launcher.widget.MIUIWidgetCompat", lpp.classLoader);
+            final Class<?> launcherCls = XposedHelpers.findClass(
+                    "com.miui.home.launcher.Launcher", lpp.classLoader);
+            XposedHelpers.findAndHookMethod(compatCls, "createItemInfo",
+                    launcherCls, android.os.Bundle.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                Object info = param.getResult();
+                                if (info == null) {
+                                    return;
+                                }
+                                Context app = appContext();
+                                if (app == null) {
+                                    return;
+                                }
+                                loadCfg(app);
+                                int spanX = XposedHelpers.getIntField(info, "spanX");
+                                int newSpan = WidgetSpan.fitSpanX(spanX, cfgColumns);
+                                if (newSpan == spanX) {
+                                    return;
+                                }
+                                XposedHelpers.setIntField(info, "spanX", newSpan);
+                                log("widget-fit(add): spanX " + spanX + "->" + newSpan
+                                        + " type=" + XposedHelpers.getIntField(info, "itemType"));
+                            } catch (Throwable t) {
+                                log("widget-fit add hook failed: " + t);
+                            }
+                        }
+                    });
+            log("hook 18 ok: MIUIWidgetCompat.createItemInfo span fit");
+        } catch (Throwable t) {
+            log("hook 18 FAILED: " + t);
+        }
+
+        // 19. replace-path fit (see class doc, item 19). Runs BEFORE the
+        // remove+add dance, so a wrong verdict leaves the desktop exactly
+        // as it was — the silent no-op the owner reported. Only bundles
+        // whose authored spanX overflows the live grid are re-judged; the
+        // stock comparison covers everything else unchanged.
+        try {
+            final Class<?> replCls = XposedHelpers.findClass(
+                    "com.miui.home.launcher.widget.MIUIWidgetReplaceHandler", lpp.classLoader);
+            final Class<?> basicInfoCls = XposedHelpers.findClass(
+                    "com.miui.home.launcher.MIUIWidgetBasicInfo", lpp.classLoader);
+            XposedHelpers.findAndHookMethod(replCls, "canReplace",
+                    android.os.Bundle.class, basicInfoCls, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                android.os.Bundle bundle = (android.os.Bundle) param.args[0];
+                                int authoredX = bundle.getInt("widget_span_x", -1);
+                                Context app = appContext();
+                                if (app == null || authoredX <= 0) {
+                                    return; // absent key: stock verdict stands
+                                }
+                                loadCfg(app);
+                                if (authoredX <= cfgColumns) {
+                                    return; // fits the live grid: stock comparison is sound
+                                }
+                                int fittedX = WidgetSpan.fitSpanX(authoredX, cfgColumns);
+                                Object old = param.args[1];
+                                int oldX = XposedHelpers.getIntField(old, "spanX");
+                                int authoredY = bundle.getInt("widget_span_y", -1);
+                                int oldY = XposedHelpers.getIntField(old, "spanY");
+                                boolean verdict = oldX >= fittedX && oldY >= authoredY;
+                                log("widget-fit(replace): authored spanX " + authoredX
+                                        + " fits to " + fittedX + ", old " + oldX + "x" + oldY
+                                        + " -> " + verdict);
+                                param.setResult(verdict);
+                            } catch (Throwable t) {
+                                log("widget-fit replace hook failed: " + t);
+                            }
+                        }
+                    });
+            log("hook 19 ok: MIUIWidgetReplaceHandler.canReplace fit");
+        } catch (Throwable t) {
+            log("hook 19 FAILED: " + t);
         }
 
         log("init complete");

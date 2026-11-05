@@ -4,6 +4,37 @@
 版本历史自 v1.6.2 起（更早无记录）；每个版本的完整改动见
 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)。
 
+## [1.8.4] - 2026-11-05
+
+- 修复：三列（及以下）列数模式下的小部件三类异常——① 原厂 4 列网格
+  放置的 2x4 不显示：越界条目（`cellX+spanX` 超过列数）在
+  `CellLayout.updateCellOccupiedMarks` 直写占用数组时抛越界异常，被
+  `Launcher.bindAppWidget` 静默吞掉，条目从未上屏（数据库行完好）；②
+  新加 2x3 偶发不显示：4 列坐标里合法的落点（cellX≥1）收窄后越界，
+  同一异常路径；③ 日历"临近日程"等**添加不了**：MIUI 小部件选择器的
+  `createItemInfo` 在"当前列数==最小列数"时用选择器 bundle 的原厂网格
+  标注 span 覆盖像素映射结果，模块把最小列数钉到设置值使该门恒真，
+  4 列标注的 spanX=4 被 `Workspace.acceptDrop` 直接拒绝放置。修复为
+  两个装载/添加单点钳制：`ItemInfo.load` after（全部五类条目共用的解析
+  汇流点，`spanX→列数` 上限、`cellX` 左移入界，**不写回数据库**，列数
+  调回重启即恢复原尺寸）+ `MIUIWidgetCompat.createItemInfo` after
+  （`spanX` 钳制，覆盖选择器拖出/预备/替换三个调用方）；MIUI 原生
+  gadget/maml 与 Android 原生小部件一并覆盖（设计文档第 14 节，含
+  4.39.12 反编译行号证据）；④ 长按「更换小部件」选择新部件**不生效**
+  （4 列正常、<4 列均触发）：`MIUIWidgetReplaceHandler.canReplace` 要求
+  旧部件运行时 span ≥ 新部件的原厂网格标注 span，收窄网格下 3≥4 恒假、
+  在移除旧部件之前无声 abort——修复为标注值超出当前列数时折算到当前
+  网格再比（钩子 19），不超界情形原厂语义逐位保留；新增 `WidgetSpan`
+  纯函数与 21 项 JVM 回归（`tools/run-tests.sh` 全套 39 项）
+- 变更（开发）：`tools/run-tests.sh` 加固——javac 改 `--release 8`（原先
+  `-source/-target 8` 可链接 Java 9+ API，本地绿但 Android Java 8 运行时
+  `NoSuchMethodError` 的假绿，实测 `List.of` 旧配置可编过、新配置正确
+  拒绝）；统一 `-encoding UTF-8`；测试类自动发现（新增 `*Test.java` 无需
+  改脚本）；失败也跑完全部测试再统一退出；`android.util.Log` shim 补全
+  公开签名（新日志调用不再以 `NoSuchMethodError` 崩测试）；仓库根软链
+  守卫（`rm -rf` 只可能在仓库根内执行）+ JDK/android.jar 缺失时人话报错；
+  产物目录 `build/tests` → `build/jvm-tests`
+
 ## [1.8.3] - 2026-11-04
 
 - 安全修复：排除清单解析与 root shell 写入注入加固（Mimosa 深度扫描

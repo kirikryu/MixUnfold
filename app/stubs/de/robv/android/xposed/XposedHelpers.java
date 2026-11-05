@@ -21,6 +21,10 @@ public final class XposedHelpers {
         return 0;
     }
 
+    public static long getLongField(Object obj, String fieldName) {
+        return 0L;
+    }
+
     public static Object getObjectField(Object obj, String fieldName) {
         return null;
     }

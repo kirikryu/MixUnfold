@@ -58,6 +58,9 @@
 | 13b | `Launcher.onConfigurationChanged` | after | 折叠/展开切换后重跑方向请求决策（复刻 `RotationHelper.notifyChange` 并按 `mLastActivityFlags` 去重）；顺带 post 偶数页检查——Launcher 自消化 configChanges（旋转不重建、不触发 onResume），不挂这里的话旋转后奇偶约束的切换要等下次 resume 才生效 |
 | 14 | `FoldScreenIndexCalculator.obtainValidCurrentScreenIndex` | before | 三页模式下吸附目标改为 3 页组边界（原生硬编码 `% 2` 成对校准并强制末页回退一位）；非三页模式不动 |
 | 15/16 | `Workspace.deleteScreen(long)` / `removeScreen(int)` | before | 偶数页保护：**仅编辑模式**中，移除末页会破坏翻页单位奇偶、且该页为空白页时否决移除（非空页始终放行；普通模式的移除属于原厂自身流程——拖边建页会重建末尾页，拦截会弄死手势）；仅展开态且「外侧边距优化」开启时生效，横屏三页模式不启用 |
+| 17 | `ItemInfo.load(Context, Cursor)` | after | 运行时小部件收缩：桌面容器（`container==-100`）条目解析后 `spanX→min(spanX,列数)`、`cellX→min(cellX,列数−spanX)`（仅 X 侧——模块从不改行数，Y 不可能越界）。**不写回数据库**，列数调回原值重启桌面即恢复原始尺寸。根因与数学见第 14 节 |
+| 18 | `MIUIWidgetCompat.createItemInfo(Launcher, Bundle)` | after | MIUI 小部件添加路径 span 归一：选择器 bundle 的 span 按**原厂网格**标注，原生仅在 `getCellCountX()==getCellCountXMin()` 时（"最窄网格，选择器尺寸可信"）用 bundle 原值覆盖——模块把 Min 钉到设置列数使该门恒真，4 列标注的 spanX=4 进入 3 列网格被 `Workspace.acceptDrop`（:1320）直接拒绝（"添加不了"）。钳制返回对象的 `spanX`，覆盖选择器拖出 / 预备 / 替换全部三个调用方（§14 根因三） |
+| 19 | `MIUIWidgetReplaceHandler.canReplace(Bundle, MIUIWidgetBasicInfo)` | before | 更换小部件路径的同一标注错配、且早一重门：`canReplace`（:15-20）要求**旧部件运行时 spanX ≥ 新部件 bundle 标注 spanX**——收窄网格下旧部件显示宽为钳制后的 3、bundle 仍标 4，`3>=4` 恒假 → `replaceWidget abort`（:72-74，在移除旧部件之前返回）→ 更换无声无息不生效（4 列 4≥4 恒过；列数 <4 均触发）。仅当标注 spanX 超出当前列数时按 `WidgetSpan.fitSpanX` 折算后重判，Y 比较与不超界情形完全走原厂语义（§14 根因四） |
 
 表中钩子 4/5/6/7/8/11/12/14/15/16 的方向/模式判定统一经 `modeCtx()`
 取**实时桌面 Activity** 的 configuration（Activity 尚未创建的进程启动早期
@@ -534,3 +537,117 @@ su shell 原样消化，测试无残留。原扫描盲区③（静态边界/无�
 
 注：Mimosa 钩子不读取本节处置状态，同一 scan ID 的 advisory
 会在后续提交/CI 中重复提示，属预期行为；以本节判定为准，勿重复处置。
+
+## 14. 三列模式下小部件不显示的根因与运行时收缩（钩子 17）
+
+**症状**（机主实测，v1.8.3）：`桌面列数=3`（一页三列，非横屏三页）时——
+1. 原厂 4 列时代放置的 2x4 小部件（满页宽）不显示，应收缩成 2x3 维持显示；
+2. 新添加的 2x3 小部件偶发不显示（MIUI/HyperOS 标准小部件；Android 原生
+   小部件疑似同病未测）；
+3. 日历"临近日程"等一批小部件**添加不了**（2026-11-05 真机反馈，
+   钩子 17 之后的增量表现，根因三）；
+4. 长按小部件 →「更换小部件」选择新部件**不生效**，仍是原部件
+（2026-11-05 真机反馈，钩子 18 验收后的增量表现；4 列正常、<4 列均触发，
+根因四）。
+
+**不显示的机制**（4.39.12 jadx 行号）：绑定渲染链
+`Workspace.addInScreen → CellLayout.addView`（CellLayout.java:1488）→
+`updateCellOccupiedMarks`（CellLayout.java:3501-3510）按
+`cellX..cellX+spanX` 对 `mOccupiedCell` 二维数组**无边界守卫直写**——
+任何 `cellX+spanX > mHCells`（=模块列数）的行抛 `ArrayIndexOutOfBounds`，
+异常沿 `Launcher.bindAppWidget` 的 `catch (RuntimeException)` 被静默吞掉
+（"server side exception,ignore it"，Launcher.java:4674-4677）→ 条目
+从未 add 进 CellLayout，**不渲染但数据库行完好**（全程无 markDeleted
+参与）。两症状同根：
+
+- 源一：存量 2x4（spanX=4）任何位置都越界（症状 1）；
+- 源二：**4 列坐标里合法的 cellX≥1**——spanX=3 的"2x3"放在 cellX=1 在
+  4 列网格完全合法，列数收窄到 3 后 1+3>3 同样越界（症状 2"偶发"的正解：
+  取决于部件落点，cellX=0 显示、cellX≥1 消失）；
+- 源三：原厂 `reCalculateSpan`（LauncherModel.java:1161-1168）跨网格
+  迁移时**只重写 span 不挪 cellX**（span 4→3 后 cellX=1 仍越界）。
+
+**添加不了的机制**（根因三，jadx 行号）：MIUI 小部件选择器的添加入口
+`MIUIWidgetCompat.createItemInfo(Launcher, Bundle)`（MIUIWidgetCompat.java:255-300）
+从 bundle 读取 `widget_span_x/y`——**按原厂网格标注**。appwidget 分支先经
+`fromProviderInfo→initSpans`（像素映射，clamp 安全），但随后：
+
+```java
+if (DeviceConfig.getCellCountX() == DeviceConfig.getCellCountXMin(launcher)) {
+    info.spanX = bundleSpanX;   // "最窄网格时选择器尺寸可信"——原厂 4==4，
+}                               // 选择器本就按 4 列出尺寸，自洽
+```
+
+模块把 Min 钉到设置列数，`3==3` 恒真 → 4 列标注的 spanX=4 原样覆盖进
+3 列网格 → `Workspace.acceptDrop`（Workspace.java:1320）`spanX > 列数`
+直接拒绝放置——小部件拖到桌面即被弹回，**根本进不了放置/装载链**。
+无 provider 的市场下载子分支（:281-289）更是无条件直取 bundle 原值。
+maml 分支（:302 `new MaMlWidgetInfo(i3,i4)`）构造器内 `calculateSpan()`
+（MaMlWidgetInfo.java:58-66）经 `getWidgetSpanX` 收敛，不受此门影响。
+三个调用方——选择器拖出 `AssistantDragOverlay`:555/:603（含
+prepare_add_widget 预备）与桌面替换 `MIUIWidgetReplaceHandler`:76——
+全部汇过该单点。
+
+**为什么原厂机制没救回来**：MIUI 按格数分库存桌面
+（`DeviceConfig.calcGridSize`，DeviceConfig.java:417-433 →
+`launcher_3x6.db`），首启缺库时 `tryToMigrateDefaultDatabase`
+（DeviceConfig.java:2191-2212）从最接近的旧库（4x6）整库拷贝并置
+`sNeedRecalculateWidgetSpan`——但该重算**只挂在 appwidget 装载路径**
+（LauncherModel.java:781-783），MIUI 自家 gadget/maml 的装载
+（`loadGadget` LauncherModel.java:840 / `loadMaMl` :909）不做任何 span
+重算，且不修正 cellX。模块在 getter 层改列数绕过了整套迁移编排，越界行
+原样进入渲染链。
+
+**修复**（钩子 17，装载路径）：`ItemInfo.load(Context, Cursor)`
+（ItemInfo.java:239-261）是全部五类桌面条目（shortcut / folder /
+appwidget / gadget / maml）装载解析的**唯一汇流点**——各子类 `load` 均
+super 调用（LauncherAppWidgetInfo:155-156、GadgetInfo :539-540、
+FolderInfo :369-370、ShortcutInfo :529-530；maml 经 LauncherModel.java:909）。
+after 钩子在解析完成后就地钳制内存 ItemInfo：
+
+- 仅桌面容器（`container==-100`）：文件夹内容用各自网格且恒 1x1，不碰；
+- `spanX→min(spanX,列数)`、`cellX→min(cellX,列数−spanX)`（负值抬 0）；
+  纯数学见 `WidgetSpan`（`WidgetSpanTest` 21 项断言，`tools/run-tests.sh`
+  全套 39 项）；
+- **不写回数据库**（机主选定的运行时收缩语义）：切回原列数重启即恢复
+  原始尺寸；原厂后续自行重排若持久化钳制值亦无冲突。
+
+**修复**（钩子 18，添加路径）：`createItemInfo` after 钳制返回对象的
+`spanX→min(spanX,列数)`（复用 `WidgetSpan.fitSpanX`），在 acceptDrop/
+预览/放置任何消费方读到之前生效；maml 分支内部已收敛，钳制为无害幂等。
+初版曾据静态分析断言"新加部件 span 全部经 `getWidgetSpanX` clamp
+（`sCellCountX` 经 `loadCellsCountConfig` :1851-1863 被已钩住的 Min/Max
+收敛到列数）、无需添加侧归一、钩子 18 取消"——该结论漏算了
+`createItemInfo` 的 bundle 覆盖门（根因三），2026-11-05 真机反馈证伪，
+钩子 18 恢复并落在此单点。落点侧仍无需归一：
+`findNearestVacantAreaByCellPos` 始终在 mHCells 边界内搜索。
+
+**残留行为**：被钳制的行若与其他条目同格会产生视觉重叠（优于不显示）；
+经钩子 18 添加的小部件按钳制后的 span 持久化（3 列下即 2x3），后续切回
+4 列保持 2x3 不再放大——与存量条目的可逆语义不同，属添加必然落库的
+固有行为；原生 `targetCellWidth` 元数据分支
+（LauncherAppWidgetProviderInfo.java:38-44）已被 maxSpanX≤列数的区间检查
+挡回像素映射，无独立风险。
+
+**更换不生效的机制**（根因四，2026-11-05 真机反馈补录）：钩子 17/18 验收
+通过后（添加/移动/移除/切列数/补页全部正常，无小部件盖图标、多余图标
+自动挤到末页——原厂 vacant 搜索的行为，与模块正交），唯一残留是长按
+小部件 →「更换小部件」→ 选择新部件**不生效、桌面原地不动**。链条：
+`replaceWidget`（MIUIWidgetReplaceHandler.java:58-100）在移除旧部件**之前**
+先过 `canReplace`（:15-20）——要求旧部件**运行时** spanX/Y ≥ 新部件
+bundle 的**标注** spanX/Y。收窄网格下旧部件显示宽为钳制值（3 列下 3），
+bundle 仍按原厂 4 列标注（4）→ `3>=4` 恒假 → abort 于任何状态改动之前，
+无任何用户可见反馈。4 列下 4≥4 恒过故不触发；列数 <4 均触发（2 列更甚）。
+修复（钩子 19）：`canReplace` before 钩子，仅当标注 spanX 超出当前列数时
+把标注值经 `WidgetSpan.fitSpanX` 折算到当前网格再比（X 折算、Y 原样——
+行数不受模块影响）；标注本就 ≤ 列数或键缺失时完全不碰，原厂判定逐位
+保留。通过后的落位复用钩子 18（`replaceWidget` 第 :76 行同样经
+`createItemInfo` 建新部件，span 已钳制），cellX/cellY 拷贝自旧部件
+（装载时已入界），无需额外处理。
+
+**Mimosa 提示处置**（2026-11-05，本节一次性记录）：编辑
+`tools/run-tests.sh` 时钩子对其 `mkdir`/`rm` 行报"命令注入"（锚点行号
+随编辑漂移，首见 :15 后移至 :51——与 §13 sink 29→36 同现象）——涉及
+变量（`OUT_DIR` 等）均为脚本内硬编码常量或开发者自设 env 覆盖，无任何
+外部输入流入命令，且新增软链调用守卫后 `rm -rf` 只可能在仓库根内执行；
+与 §13 已裁决的静态残留同族误报，不处置。
