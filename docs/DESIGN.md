@@ -490,7 +490,9 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
 为 1.8.x 历史记录与 Seal 语义，新配置存储见第 15 节。1.9.0 复扫回执
 `scan-2026-11-05T05-27-59.604Z-c054b961ad74`（Seal
 `sha256:a6136f52…47e44c7`，deep）：**0 findings**，旧 finding 随
-`RootWriter` 删除消失。
+`RootWriter` 删除消失；发布后机主复核深扫（优先复核迁移改动文件）
+`scan-2026-11-05T08-30-31.496Z-e3dc0657370d`（Seal
+`sha256:d36c9e9a…3df01cf5`）同为 **0 findings**（详见第 15 节）。
 
 **根因**：`cetus_free_rot_exclude` 存于 `Settings.System`，该命名空间对
 持用户授予 `WRITE_SETTINGS` 的任意第三方应用可写（无 per-key ACL）。
@@ -774,3 +776,15 @@ PACKAGE_REPLACED 刷新）再重启——实测 `parse_failures=0`、三进程�
 finding `finding:5ed4ef6ce64178f2ca8f9225` 消失——`RootWriter` /
 `shellQuote` 已删除，配置读取不再流向任何 su 汇点；V3 元数据 /
 MODE_WORLD_READABLE 探测回落 / HookPrefs 监听器等新增面零 finding。
+
+发布后机主复核深扫回执（v1.9.0 tag/Release 发布之后）：
+`scan-2026-11-05T08-30-31.496Z-e3dc0657370d`（Seal
+`sha256:d36c9e9a…3df01cf5`，deep，仅静态分析）：**0 findings、无
+hypotheses（投研阶段未产生待复核猜想）**；依赖 `not_applicable`
+（无依赖清单，0 包进入依赖扫描，符合零 AAR 约定）；优先复核项为迁移
+提交 `6190817` 的全部现存改动文件（MixPrefs / HookPrefs /
+PrefsMigration / MainHook / SettingsWriter / MainActivity /
+AppPickerActivity / PrefsKeys / ExcludeCodec / AndroidManifest）。与
+终态扫描结论同源一致。照例声明：0 finding 是本轮静态深扫的密封结论，
+佐证迁移消除了既有危险项，不等同于"项目无风险"（静态覆盖边界见第
+13 节 Seal 语义与 completeness 说明）。
