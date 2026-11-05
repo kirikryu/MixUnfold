@@ -4,6 +4,61 @@
 版本历史自 v1.6.2 起（更早无记录）；每个版本的完整改动见
 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)。
 
+## [1.9.0] - 2026-11-05
+
+- 安全修复：配置存储从 `Settings.System` 迁移到模块私有
+  `SharedPreferences("mixunfold_prefs")`，从结构上消除 Mimosa 反复报告的
+  跨文件污点链（`finding:5ed4ef6ce64178f2ca8f9225`：旧配置键对持
+  `WRITE_SETTINGS` 的第三方应用可写，模块未获授权时经
+  `SettingsWriter → RootWriter.exec("su")` 回退写入）。1.9.0 起模块 app
+  是唯一写方（`MixPrefs`，`commit()` 同步落盘），launcher / SystemUI /
+  system_server 只经 classic `XSharedPreferences` 只读（`HookPrefs`）；
+  删除 `RootWriter`、`shellQuote`、`settingShellLine` 与
+  `WRITE_SETTINGS` 声明，配置写入不再需要权限或 root。`ExcludeCodec`
+  保留为迁移值/备份恢复值的输入校验，旧键只读回落、不再写回。
+- 变更：升级兼容——覆盖安装首次打开 app 时把 1.8.x 的 8 个旧键快照进私有
+  存储（`contains` 判定缺失键，不用默认值比较；缺失项写默认值，排除清单
+  过白名单）。升级后尚未打开 app 时钩子只读回落旧键，行为与 1.8.4 一致；
+  卸载重装以默认值工作（`firstInstallTime == lastUpdateTime` 判为非升级，
+  旧键被忽略）。只清除应用数据（不卸载）可能重新导入旧键，属已知边界。
+- 变更：即时性——`cetus_free_rot` / `cetus_free_rot_exclude` 在
+  system_server 内 500ms 去抖 `reload()` 兜底，LSPosed 文件 watcher
+  （`xposedsharedprefswatcher` 元数据）可用时置 dirty 跳过等待；真机
+  （LSPosed 2.2.1）实测监听器注册成功、总开关关/开切换 `free-rot config
+  reloaded` 即时出现、无需重启。列数/页数/边距/锁屏开关仍按原语义重启
+  桌面/SystemUI 生效。
+- 变更：跨进程读取实测——classic `XSharedPreferences` 直读
+  `/data/data` 被 SELinux 拦截（hook 进程 `contains()` 恒 false），
+  改用 LSPosed 新 XSharedPreferences（清单 `xposedsharedprefs` 元数据 +
+  String 构造器，lspd root 守护读取，不依赖 prefs 文件世界可读位）；
+  app 侧 `MODE_WORLD_READABLE` 被拒（探测一次后缓存、回落
+  MODE_PRIVATE，无害）。launcher / SystemUI / system_server 三进程实测
+  `readable=true`、`source=prefs`。
+- 变更：安装通道——`adb install`（流式）产生的 APK 路径在本机
+  LSPosed 2.2.1 守护开机扫描时报 ENOENT、system_server 静默不注入
+  （未改动 1.8.4 基线对照复现，非本版回归）；处置为 `adb push` 后设备
+  本地 `pm install -r` 再重启（设计文档第 10/15 节），实测恢复三进程
+  注入。
+- 变更：README 的 `adb shell settings put system cetus_*` 命令不再生效，
+  配置只通过控制面板修改；控制面板移除「授予修改系统设置」入口与相关
+  文案，写入失败提示改为检查应用存储空间。排除计数改用 `ExcludeCodec`，
+  与实际生效清单一致。卸载重装配置归零、覆盖升级保留。
+- 变更（开发）：新增 `PrefsKeys`（键/默认值唯一表）、`PrefsMigration`
+  （contains 语义纯逻辑）、`MixPrefs`（app 写入 + 旧键迁移）、
+  `HookPrefs`（只读 XSP 桥）与 `XSharedPreferences` 编译期 stub；
+  `tools/run-tests.sh` 改为编译 `ExcludeCodec` / `PrefsKeys` /
+  `PrefsMigration` / `WidgetSpan`，新增 `PrefsMigrationTest`（20 项），
+  删除 shell 引号用例，全套 55 项。控制面板「重启系统桌面」保留原有
+  `su` + 固定命令（全仓库唯一 exec，无配置值流入；取舍见设计文档第 15 节）。
+- 安全验证：Mimosa deep 复扫（真机验证后终态）
+  `scan-2026-11-05T08-12-48.840Z-17944a7abb92`（Seal
+  `sha256:50ac27a5…f3f74dd0ea`）：**0 findings**，1.8.4 的唯一跨文件污点
+  finding 消失；依赖风险 0。
+- 已知行为：锁屏开关在首次解锁前（direct boot 窗口）按默认开处理——
+  credential-protected prefs 在该窗口不可读，与 1.8.4 默认值一致；
+  device-protected 存储路径已实现（`MixPrefs.USE_DEVICE_PROTECTED`
+  常量）未默认启用。第二空间（多用户）路径已实现、未实测。
+
 ## [1.8.4] - 2026-11-05
 
 - 修复：三列（及以下）列数模式下的小部件三类异常——① 原厂 4 列网格

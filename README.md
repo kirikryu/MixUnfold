@@ -69,10 +69,12 @@
 | 内屏自由旋转 | 开 | 总开关：内屏展开时所有应用跟随系统自动旋转（含原生锁定方向的应用），即时生效；合盖后外屏强制竖屏（视频全屏等显式横屏除外） |
 | 排除应用 | 空 | 二级界面按应用勾选（带搜索）；清单内的应用维持原厂方向行为，即时生效 |
 
-- **旋转开关与排除清单改动即时生效**：首次使用需点面板顶部按钮授予
-  「修改系统设置」权限（一次性；root 授权作为回退通道）
-- 桌面布局项（列数/页数/边距）改动后需点 **重启系统桌面** 生效（需 root）；
-  重启后建议横竖屏切换几次，让布局优化完全应用
+- **旋转开关与排除清单改动 ≤0.5 秒内生效**，无需额外权限；配置保存在
+  模块私有存储中，不写入系统设置
+- 桌面布局项（列数/页数/边距）改动后需点 **重启系统桌面** 生效（需 root，
+  LSPosed 本身即要求 root）；重启后建议横竖屏切换几次，让布局优化完全应用
+- 覆盖升级保留原有配置；卸载重装后配置归零（模块以默认值工作，旧版
+  系统设置键会被忽略）
 - 拖动图标新增页面后若总页数变为奇数，末尾的配对空白页要等下次
   锁屏解锁、旋转屏幕或离开桌面再返回时才补上（详见
   [FAQ](docs/faq.md#拖动图标新增页面后末尾空白页未立即出现)）
@@ -84,19 +86,13 @@
 - 横屏锁屏可能出现布局异常（时钟/壁纸/手势区等，小米未适配 cetus 横屏锁屏
   UI）；出问题关闭「锁屏允许横屏」并重启系统界面即可回退
 
-命令行等价（可选，无需打开应用）：
+配置通过控制面板修改。1.9.0 起配置存于模块私有存储，旧版的
+`adb shell settings put system cetus_*` 命令不再生效（仅升级后首次打开
+模块 app 前，钩子为兼容会只读旧键）。重启命令仍可用：
 
 ```bash
-adb shell settings put system cetus_home_columns 3
-adb shell settings put system cetus_home_pad_opt 1
-adb shell settings put system cetus_home_land_pages 3
-adb shell settings put system cetus_home_lockscreen_rot 1
 adb shell am force-stop com.miui.home            # 桌面设置改动后重启桌面
 adb shell pkill -f com.android.systemui          # 锁屏设置改动后重启系统界面
-
-# 内屏自由旋转（即时生效，无需重启）
-adb shell settings put system cetus_free_rot 1
-adb shell settings put system cetus_free_rot_exclude com.foo;com.bar
 ```
 
 排除清单段按包名字符集（`[A-Za-z0-9_.]`）白名单过滤，非法段丢弃并记

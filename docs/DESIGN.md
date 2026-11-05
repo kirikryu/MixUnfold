@@ -46,12 +46,12 @@
 | 1 | `DeviceConfig.updateRotate` | after | `sRotatable = isInFoldDeviceLargeScreen(ctx)`，去除 cetus 排除；上下文优先取**实时桌面 Activity**（见 1b） |
 | 1b | `DeviceConfig.isRotatable` | before | 消费点实时重判折叠态：按桌面当前所在屏的 `smallestScreenWidthDp`（内屏 ≈654dp、外屏 ≈393dp，阈值 600），MIUI 自家 `isInFoldDeviceLargeScreen(实时上下文)` 作后备 |
 | 2 | `LauncherCellCountCompatDevice.shouldUseDeviceValue` | replace→true | 绕过密度/主题门槛，保证设备值生效 |
-| 3 | 基类 `getCellCountXDef/Max/Min` + Fold/Cetus 子类 `…FromDevice` | replace→统一列数 | 桌面列数（设置键 `cetus_home_columns`） |
+| 3 | 基类 `getCellCountXDef/Max/Min` + Fold/Cetus 子类 `…FromDevice` | replace→统一列数 | 桌面列数（配置键 `cetus_home_columns`，私有 prefs，见第 15 节） |
 | 4 | `DeviceConfig.setWorkspaceCellPadding` | after | 展开态 `sWorkspaceCellPaddingSide = B/2`（B 为外侧边距，竖/横独立键） |
 | 5 | `CellLayout.onScreenOrientationChanged/onScreenSizeChanged` | after | 偶数页 `paddingLeft = B`、奇数页 `= 0`（反向对齐，模数随横屏页数）；仅展开态生效 |
 | 6/7 | `CellScreen.createCellScreen/onScreenSizeChanged/onScreenOrientationChanged` | after | 页宽刷新：竖持 `屏宽/2`、横持三页模式 `屏宽/3`（原生仅在创建时赋值一次） |
 | 8 | `DeviceConfig.calcGridSize` | after | 三页模式下工作宽跟随 `屏宽/3`，并触发 `calculateCellSize` 重算 |
-| 9 | `DeviceConfig.getCellCountX` | before→实时列数 | 原生列数进程启动后缓存且旋转不重读；设置值进程内缓存一次，热路径零额外查询 |
+| 9 | `DeviceConfig.getCellCountX` | before→实时列数 | 原生列数进程启动后缓存且旋转不重读；配置值进程内缓存一次，热路径零额外查询 |
 | 10 | `Application.onCreate` | after | 注册进程内重启广播接收器 |
 | 11/12 | `Launcher.onResume` / `Launcher.onConfigurationChanged`（13b 复用路径）/ `Workspace.reorderScreens`（后两者 post 延迟执行） | after | 偶数页策略：页数为奇且末页**有内容**时补 1 页空白；末尾空白页**一律不动**（可能是原厂拖拽预备页或用户刚建的页，见第 12 节）；编辑模式跳过；重入锁防双补；onResume 顺带触发 13b 的方向重发（去重，无开销） |
 | 13 | `Launcher.checkDualScreen` | after | 三页模式下把每页页宽重新设为 `屏宽/3`：原生在每次配置变化后重断言页宽 `屏宽/2`，会覆盖钩子 6/7 的结果 |
@@ -67,8 +67,12 @@
 回退 app 上下文）。根因见第 12 节：app 上下文的方向在折叠切换后同样残留
 旧值，曾致横屏三页模式偶发误补空白页。
 
+配置来源自 1.9.0 起为模块私有 `SharedPreferences`（写路径、迁移与
+跨进程读取见第 15 节）；钩子目标、方式、数学与编号均未变化。
+
 另有 `Application.onCreate` after 中注册的进程内广播接收器
-（`cetushome.rotationunlock.RESTART`），供控制面板触发桌面重启。
+（`cetushome.rotationunlock.RESTART`），保留作手动/调试重启入口；控制
+面板的「重启系统桌面」走固定命令的 su 路径（见第 15 节），不发送该广播。
 
 第三目标进程 `system_server`：**引擎模式（E0+E1，见第 11 节）**——点亮休眠的
 MIUI 折叠横屏引擎并桥接排除清单（E0）与平行窗口旋转（E1）；第 10 节的
@@ -276,23 +280,23 @@ g) 非多窗口、非 MIUI 尺寸兼容——**例外：MIUI 平行窗口（嵌�
 W2/W3 查询取的是同一引用（各自的 `param.thisObject`），零反射；IBinder
 token 方案需在两侧各加一次反射取 token，无收益。
 
-**配置**（两项，`Settings.System`，system_server 内 ContentObserver 缓存，
-切换即时生效无需重启）：
+**配置**（两项，模块私有 prefs；存储、迁移与跨进程读取见第 15 节。
+system_server 在 `freeRotOn()` 内做 500ms 去抖重读，切换 ≤0.5s 生效，
+无需重启）：
 
 - 总开关 `cetus_free_rot`：1=开（默认）。关闭后即使成员在弱表中也全部
   不改写（全机恢复原厂）。
 - 排除清单 `cetus_free_rot_exclude`：分号分隔包名。语义只有一种：清单内
   的应用不旋转（维持原厂方向行为），其余全部跟随旋转。段按
   `^[A-Za-z0-9_.]+$` 白名单过滤（公共 `ExcludeCodec` 统一解析/重组，
-  非法段丢弃并记 logcat）：该键对持 `WRITE_SETTINGS` 的第三方应用可写，
-  毒化存量值不得流入常驻 su shell 写路径；sink 侧另有
-  `RootWriter.shellQuote` POSIX 单引号转义兜底（su stdin 必经 shell
-  解析，参数数组无法消除该层）。
+  非法段丢弃并记 logcat）：该值可能来自 1.8.x `Settings.System` 的
+  迁移，仍按不可信输入处理，非法段不进入匹配逻辑。
 
-懒加载红线：`handleLoadPackage("android")` 时 SettingsProvider 未就绪，
-首次 hook 调用（`freeRotOn()`）才读配置；读取失败保持未加载态、下次调用
-重试（期间取默认值：功能开、无排除）。Observer 注册失败仅损失即时性，
-不损失正确性。
+懒加载红线：`handleLoadPackage("android")` 时 SettingsProvider 未就绪；
+私有 prefs 无 provider 依赖。仅当本次是覆盖升级且 prefs 仍缺 key 时，
+才只读回落旧 `Settings.System`——provider 未就绪则保持未加载态、下次
+调用重试（期间取默认值：功能开、无排除）。迁移完成后 8 个键齐全，不再
+读旧命名空间。
 
 **内置相机名单**（代码常量，不可配置，任何状态排除；成像方向依赖传感器，
 永远不动）：`com.android.camera`、`com.android.cameraextensions`、
@@ -336,7 +340,7 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
   未设) && MIUI 优化 && 智能旋转设置` → cetus 上恒 false；但
   `IS_FOLD = persist.sys.muiltdisplay_type==2` 实机为 **true**，引擎完整
   可用。E0 = hook `isEnabled()` 前置返回总开关状态（`cetus_free_rot`，
-  懒加载 + ContentObserver 与第 10 节同源）。
+  懒加载 + 500ms 去抖重读，配置存储见第 15 节）。
 - **点亮后的原生能力**（全部是手搓 W1–W5 试图复刻的）：写点中和
   （`info.screenOrientation=-1` + `super(-1)`，启动窗构造性一致，闪帧/
   颓顿问题簇不存在）；内外屏旋转设置原生分离
@@ -480,6 +484,14 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
 
 ## 13. 排除清单注入加固与安全扫描 Seal 语义
 
+**1.9.0 退役说明**：配置迁入模块私有 prefs 后，`RootWriter` /
+`shellQuote` / `settings put` 写入链已整体删除，本节加固的 su 注入面
+不复存在；`ExcludeCodec` 保留为迁移值 / 备份恢复值的输入校验。以下
+为 1.8.x 历史记录与 Seal 语义，新配置存储见第 15 节。1.9.0 复扫回执
+`scan-2026-11-05T05-27-59.604Z-c054b961ad74`（Seal
+`sha256:a6136f52…47e44c7`，deep）：**0 findings**，旧 finding 随
+`RootWriter` 删除消失。
+
 **根因**：`cetus_free_rot_exclude` 存于 `Settings.System`，该命名空间对
 持用户授予 `WRITE_SETTINGS` 的任意第三方应用可写（无 per-key ACL）。
 毒化存量值（含单引号的段）经排除选择器回读重组后，曾原样拼入常驻
@@ -492,7 +504,8 @@ toggle + 模块自身未持该权限走 su 回退）。
 记 logcat；`SettingsWriter` String 写入前过滤）+ sink 侧
 `RootWriter.shellQuote` POSIX 单引号转义（su 非交互参数形式在主流实现
 仍过 `sh -c`，参数数组不能消除 shell 层，故在 sink 转义兜底）。回归：
-`tools/run-tests.sh`（15 项，含严格引号文法不可闭合校验）。
+`tools/run-tests.sh`（当轮 15 项，含严格引号文法不可闭合校验；1.9.0 起
+shell 层用例已随 `RootWriter` 删除，parse/join 白名单用例保留）。
 
 **Seal 语义**（Mimosa 扫描，重要）：扫描产物目录中的 **Seal 派生自
 扫描元数据（含时间戳等实例信息），不是纯内容哈希——同一工作区重扫
@@ -659,3 +672,105 @@ bundle 仍按原厂 4 列标注（4）→ `3>=4` 恒假 → abort 于任何状�
 变量（`OUT_DIR` 等）均为脚本内硬编码常量或开发者自设 env 覆盖，无任何
 外部输入流入命令，且新增软链调用守卫后 `rm -rf` 只可能在仓库根内执行；
 与 §13 已裁决的静态残留同族误报，不处置。
+
+1.9.0 的配置存储迁移只改变列数/边距的读取来源，钩子 17–19 的钳制数学、
+`WidgetSpan` 纯函数与"不写回数据库"语义不变。
+
+## 15. 配置存储迁移（1.9.0）
+
+**根因**：1.8.x 的 8 个配置键存于 `Settings.System`，该命名空间对持
+用户授予 `WRITE_SETTINGS` 的任意第三方应用可写（无 per-key ACL）；模块
+app 未获该权限时经 `SettingsWriter → RootWriter.exec("su")` 回退写入。
+Mimosa 因此反复报告跨文件污点
+`finding:5ed4ef6ce64178f2ca8f9225`（source 为配置读取、sink 为 su
+shell；锚点随代码漂移，1.8.4 复扫落在 E1 Javadoc 注释内）。1.8.3 的
+白名单 + `shellQuote` 只能让静态分析无法证明闭合，不能消除 source/sink
+本身。
+
+**目标架构**：
+
+| 进程 | 角色 | 机制 | 生效 |
+|---|---|---|---|
+| 模块 app | 唯一写方 | `SettingsWriter → MixPrefs → SharedPreferences("mixunfold_prefs", MODE_PRIVATE)`，`commit()` 同步落盘 | 立即 |
+| `com.miui.home` | 只读 | `HookPrefs`（classic `XSharedPreferences`）在 `loadCfg` 一次读取 | 重启桌面 |
+| `com.android.systemui` | 只读 | `loadLockRotCfg` 一次读取 | 重启 SystemUI |
+| `system_server` | 只读 | `ensureSysCfg` 首读；`freeRotOn()` 内 500ms 去抖 `reload()`；XSP 监听器可用时置 dirty 跳过等待 | ≤0.5s |
+| 任意 hook 进程 | 禁止写 | `XSharedPreferences.edit()` 抛 `UnsupportedOperationException`；代码无 `Settings.System` 写路径 | — |
+
+键名与默认值原样保留（`PrefsKeys`）：`cetus_home_columns`(3)、
+`cetus_home_padding_side`(120)、`cetus_home_padding_side_land`(120)、
+`cetus_home_land_pages`(3)、`cetus_home_pad_opt`(0)、
+`cetus_home_lockscreen_rot`(1)、`cetus_free_rot`(1)、
+`cetus_free_rot_exclude`("")。`PrefsKeys.LEGACY_KEYS` 是迁移与回落的
+唯一键表，`PrefsMigrationTest` 逐字锁定。
+
+**迁移判定**：`SharedPreferences.contains()` 是唯一判据——已存的 0/false
+是有效值，不与默认值比较。app 每次启动补齐缺失键并写
+`mixunfold_migrated_v1`；是否把旧 `Settings.System` 值作为来源由
+`PackageInfo.firstInstallTime < lastUpdateTime` 决定：
+
+| 场景 | 判定 | app 行为 | hook 行为 |
+|---|---|---|---|
+| 1.8.4 覆盖升级 | firstInstall < lastUpdate | 复制旧值，缺失键写默认；exclude 过 `ExcludeCodec`；写 marker | app 运行前缺 key 只读旧值；运行后 8 键齐全 |
+| 全新安装 / 卸载重装 | firstInstall == lastUpdate | 忽略旧命名空间，写默认 + marker | 默认值（卸载即失效） |
+| 升级后未打开 app | firstInstall < lastUpdate，prefs 空 | 未迁移 | 只读旧值，行为与 1.8.4 一致 |
+| 清除应用数据（未卸载） | firstInstall < lastUpdate | 重新导入旧值 | 已知边界：如需彻底归零，卸载重装（见 FAQ） |
+
+旧 `Settings.System` 键不删除（模块无写权限，且升级回落需要）；重装靠
+安装时间判定忽略它们。多用户按 hook 进程 `uid / 100000` 拼
+`/data/user[_de]/<user>/...`；用户 0 完整支持，第二空间仅在模块同样
+安装并打开过时有效（待真机验证）。
+
+**存储上下文（真机实测，LSPosed 2.2.1 / cetus HyperOS 1.0）**：首选的
+classic 直读路线（`XSharedPreferences(File)` 读
+`/data/data/<pkg>/shared_prefs`）**实测被 SELinux 拦截**——桥构造成功但
+`contains()` 恒 false（`source=legacy/default` 而值正确），hook 进程对
+其它 app 私有文件无读权。已切换 **LSPosed 新 XSharedPreferences（V3）**：
+清单声明 `xposedsharedprefs` + `xposedsharedprefswatcher` 元数据，app 侧
+尝试 `MODE_WORLD_READABLE`（模块 app 进程实测被拒 `SecurityException:
+MODE_WORLD_READABLE no longer supported`，探测一次后缓存、回落
+MODE_PRIVATE——**V3 由 lspd root 守护读取/转发，不依赖 DAC 世界可读位**，
+回落无害），hook 侧用 `XSharedPreferences(pkg, name)` String 构造器由
+LSPosed 解析可读路径。实测 launcher / SystemUI / system_server 三进程
+`prefs bridge ready, readable=true`、`config loaded ... source=prefs`。
+`MixPrefs.USE_DEVICE_PROTECTED` 仍默认 `false`（CE 路径实测可用）；
+DE 路径保留常量开关未实测（direct boot 需求出现时再切换）。
+
+**跨进程即时性（真机实测）**：watcher 通道**可用**——modules 日志
+`prefs change listener registered`（system_server），清单
+`xposedsharedprefswatcher` 元数据生效；总开关关/开真机切换，
+`free-rot config reloaded: on=false` / `on=true` 均在切换后即时出现
+（无需重启，多次连续切换逐一跟上、顺序正确）。写侧无逐毫秒时间戳，
+未测得精确延迟值；通道语义为 watcher 置 dirty → 下一次 hook 调用立即
+`reload()`（跳过 500ms 等待），watcher 不可用时退化为 500ms 轮询。
+500ms 轮询兜底保留。
+
+**安装通道坑（真机复现 + HEAD 对照）**：`adb install`（流式/增量）产生
+的 APK 路径，lspd 守护开机扫描时 `ziparchive` 打开报 ENOENT（守护
+verbose 日志），PackageParser 解析失败 → system_server 静默不注入；
+launcher/SystemUI 走 zygote 注入不受影响。**HEAD（未改动 1.8.4 基线）
+对照复现同样失败**，确认非本迁移回归、为环境问题。处置即 DESIGN 第 10
+节已记录路径：`adb push` 到设备本地后 `pm install -r`（触发
+PACKAGE_REPLACED 刷新）再重启——实测 `parse_failures=0`、三进程正常
+注入。另：卸载重装后模块需在管理器重新启用 + 「系统框架」作用域需重新
+确认（FAQ 已有）。
+
+**安全边界**：删除 `RootWriter`、`shellQuote`、`settingShellLine` 与
+`WRITE_SETTINGS` 声明；配置写入不再需要权限或 root。`ExcludeCodec`
+保留（迁移值/备份恢复值仍按不可信输入过滤）。`MainActivity` 的
+「重启系统桌面」保留原有 `Runtime.exec("su")` + 固定命令
+（`am force-stop` + HOME）——这是全仓库唯一 exec，无任何配置/用户数据
+流入；它是 1.8.4 实机验证过不会留下 AMS 脏状态的重启路径。是否改为
+广播或移除按钮需机主另行决定（任务书"全仓库无 exec"理想与此处的取舍
+见 CHANGELOG 1.9.0）。
+
+**回退路线**：1.9.x 保留只读旧键回落；下个大版本删除回落与 `MixPrefs`
+中的 legacy 读取。`USE_DEVICE_PROTECTED` 切换不需要改键名或迁移逻辑。
+
+**Mimosa 回执**（2026-11-05，1.9.0 终态，deep）：
+`scan-2026-11-05T08-12-48.840Z-17944a7abb92`（Seal
+`sha256:50ac27a5…f3f74dd0ea`），**0 findings**；依赖风险 0
+（completion=not_applicable）。真机验证后的终态复扫：1.8.4 基线唯一
+finding `finding:5ed4ef6ce64178f2ca8f9225` 消失——`RootWriter` /
+`shellQuote` 已删除，配置读取不再流向任何 su 汇点；V3 元数据 /
+MODE_WORLD_READABLE 探测回落 / HookPrefs 监听器等新增面零 finding。

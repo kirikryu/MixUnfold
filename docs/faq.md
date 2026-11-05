@@ -31,8 +31,20 @@ Android 允许覆盖安装（保留数据升级）须**同时**满足：
 3. 新 APK 的 `versionCode` 不低于已安装版本
 4. 用户允许安装未知来源应用（adb 安装还需 USB 调试授权）
 
-第 2 条不满足时系统报"签名不一致"，必须先卸载旧版（桌面布局数据会丢）。
-官方版与本地源码构建版签名不同，**不能互相覆盖安装**。
+第 2 条不满足时系统报"签名不一致"，必须先卸载旧版。1.9.0 起模块配置
+存于模块私有存储，卸载即清除（重装以默认值工作）；桌面布局数据在系统
+桌面自己的存储中，不受模块卸载影响。官方版与本地源码构建版签名不同，
+**不能互相覆盖安装**。
+
+### 卸载重装后配置还在吗
+
+- **覆盖升级**（不卸载）：保留原配置。1.9.0 首次启动会把 1.8.x 的
+  `Settings.System` 旧键快照进私有存储；若升级后还没打开过模块 app，
+  钩子会只读回落旧键，因此行为与 1.8.4 一致。
+- **卸载重装**：私有存储随卸载删除，模块以默认值工作；旧版
+  `Settings.System` 键不会被重新采用。
+- 只清除应用数据（不卸载）属于边界情况：安装时间仍判为升级，旧键可能
+  被重新导入；需要彻底归零请卸载重装。
 
 ### 校验签名证书
 
@@ -132,11 +144,25 @@ adb logcat -d | grep CetusHomeHook   # 出现 "init complete" 即注入成功
    需要重新确认）；
 2. 整机重启一次；
 3. 确认注入：`adb logcat -d | grep CetusHomeHook` 应出现
-   `attached to system_server` 与 `hook W1/W2/W3 ok`。
+   `attached to system_server` 与引擎模式钩子 `hook E0/E1a/E1b ok`
+   （旧 ROM 回退路径为 `hook W1/W2/W3 ok` 等），以及
+   `free-rot config loaded ...`。
 
 覆盖安装后 system_server 不注入但桌面正常、且日志出现
-`Failure to parse package archive ... No such file or directory` 的，
-重新安装一次模块（设置里允许 USB 安装，或 `su -c pm install -r`）再重启。
+`Failure to parse package archive ...`（LSPosed 守护日志中可见
+`ziparchive ... No such file or directory`）的：`adb install`（流式）
+产生的 APK 路径在部分 LSPosed 版本的开机扫描中打不开。有效处置是把
+APK 推到设备本地后用系统 pm 重装一次，再整机重启：
+
+```bash
+adb push MixUnfold.apk /data/local/tmp/MixUnfold.apk
+adb shell su -c 'pm install -r /data/local/tmp/MixUnfold.apk'
+adb reboot
+```
+
+（2026-11-05 实测：同一 APK 用 `adb install -r` 后重启 system_server
+静默不注入，改用上述本地 `pm install -r` 后恢复；桌面/SystemUI 注入
+不受该问题影响。）
 
 ## 合盖后外屏强制竖屏
 
