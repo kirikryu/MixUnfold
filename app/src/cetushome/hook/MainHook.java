@@ -4,12 +4,10 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
-import android.database.ContentObserver;
 import android.database.Cursor;
-import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.provider.Settings;
+import android.os.SystemClock;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -122,25 +120,34 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * registered app and the folded cover screen is never touched (live
  * per-record fold gate, failures closed to "no rewrite").
  *
- * Settings are read ONCE per process into a static cache and refreshed by
- * restarting the process (launcher from the module UI; SystemUI via
- * `pkill -f com.android.systemui`). The system_server side instead watches
- * its two keys with a ContentObserver — switch and exclusion list apply
- * immediately, no restart. Hook bodies must stay cheap because getCellCountX
- * and getOrientation sit on hot layout paths.
+ * Config lives in the module's private SharedPreferences (MixPrefs is the
+ * only writer); the hook processes read it through the read-only
+ * HookPrefs bridge. Launcher and SystemUI snapshot their keys once per
+ * process and are refreshed by restarting the process (launcher from the
+ * module UI; SystemUI via `pkill -f com.android.systemui`). system_server
+ * polls reload() behind a 500 ms debounce, so the free-rotation switch and
+ * exclusion list apply without a restart. Hook bodies must stay cheap because
+ * getCellCountX and getOrientation sit on hot layout paths.
+ *
+ * Legacy Settings.System is read-only fallback for the one case where a user
+ * upgraded but has not opened the module app yet (MixPrefs decides; a fresh
+ * install/reinstall never reads it).
  */
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "CetusHomeHook";
     public static final String ACTION_RESTART = "cetushome.rotationunlock.RESTART";
-    public static final String KEY_COLUMNS = "cetus_home_columns";
-    public static final String KEY_PAD_PORT = "cetus_home_padding_side";
-    public static final String KEY_PAD_LAND = "cetus_home_padding_side_land";
-    public static final String KEY_LAND_PAGES = "cetus_home_land_pages";
-    public static final String KEY_PAD_OPT = "cetus_home_pad_opt";
-    public static final String KEY_LOCK_ROT = "cetus_home_lockscreen_rot";
-    public static final String KEY_FREE_ROT = "cetus_free_rot";
-    public static final String KEY_ROT_EXCLUDE = "cetus_free_rot_exclude";
+    // Compile-time aliases of the canonical private-prefs key table. javac
+    // inlines these constants, so the UI call sites keep their values without
+    // a runtime dependency on PrefsKeys.
+    public static final String KEY_COLUMNS = PrefsKeys.KEY_COLUMNS;
+    public static final String KEY_PAD_PORT = PrefsKeys.KEY_PAD_PORT;
+    public static final String KEY_PAD_LAND = PrefsKeys.KEY_PAD_LAND;
+    public static final String KEY_LAND_PAGES = PrefsKeys.KEY_LAND_PAGES;
+    public static final String KEY_PAD_OPT = PrefsKeys.KEY_PAD_OPT;
+    public static final String KEY_LOCK_ROT = PrefsKeys.KEY_LOCK_ROT;
+    public static final String KEY_FREE_ROT = PrefsKeys.KEY_FREE_ROT;
+    public static final String KEY_ROT_EXCLUDE = PrefsKeys.KEY_ROT_EXCLUDE;
 
     private static Class<?> dcCls;
     private static Class<?> appCls;
@@ -169,17 +176,37 @@ public class MainHook implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + ": " + msg);
     }
 
+    /** Prefs first (contains() distinguishes an absent key from a stored
+     *  0/false); only an in-place upgrade with a still-missing key falls back
+     *  to the legacy Settings.System value. Never writes. */
     private static int readInt(Context ctx, String key, int def) {
         try {
-            return android.provider.Settings.System.getInt(ctx.getContentResolver(), key, def);
+            if (HookPrefs.contains(key)) {
+                return HookPrefs.getInt(key, def);
+            }
+            return MixPrefs.legacyIntIfUpgrade(ctx, key, def);
         } catch (Throwable t) {
             return def;
+        }
+    }
+
+    private static String readString(Context ctx, String key) {
+        try {
+            if (HookPrefs.contains(key)) {
+                return HookPrefs.getString(key, null);
+            }
+            return MixPrefs.legacyStringIfUpgrade(ctx, key);
+        } catch (Throwable t) {
+            return null;
         }
     }
 
     private static void loadCfg(Context ctx) {
         if (cfgLoaded || ctx == null) {
             return;
+        }
+        if (!HookPrefs.ensureReady()) {
+            return; // bridge not up yet — retry on a later hook call
         }
         cfgColumns = readInt(ctx, KEY_COLUMNS, 3);
         cfgPadPort = readInt(ctx, KEY_PAD_PORT, 120);
@@ -189,7 +216,8 @@ public class MainHook implements IXposedHookLoadPackage {
         cfgLoaded = true;
         log("config loaded: columns=" + cfgColumns + " padPort=" + cfgPadPort
                 + " padLand=" + cfgPadLand + " landPages=" + cfgLandPages
-                + " padOpt=" + cfgPadOpt);
+                + " padOpt=" + cfgPadOpt
+                + " source=" + (HookPrefs.contains(KEY_COLUMNS) ? "prefs" : "legacy/default"));
     }
 
     /** Keyguard switch for the SystemUI process, read once from the shade
@@ -199,9 +227,13 @@ public class MainHook implements IXposedHookLoadPackage {
         if (lockRotCfgLoaded || ctx == null) {
             return;
         }
+        if (!HookPrefs.ensureReady()) {
+            return; // bridge not up yet — retry on a later hook call
+        }
         cfgLockRot = readInt(ctx, KEY_LOCK_ROT, 1) == 1;
         lockRotCfgLoaded = true;
-        log("systemui config loaded: lockRot=" + cfgLockRot);
+        log("systemui config loaded: lockRot=" + cfgLockRot
+                + " source=" + (HookPrefs.contains(KEY_LOCK_ROT) ? "prefs" : "legacy/default"));
     }
 
     private static Context appContext() {
@@ -1219,6 +1251,10 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean sysCfgReady;
     private static volatile boolean cfgFreeRot = true;
     private static volatile HashSet<String> cfgExclude = new HashSet<String>();
+    /** Last private-prefs reload attempt (uptime ms); guards the 500 ms poll. */
+    private static volatile long lastCfgPoll;
+    private static final long CFG_POLL_MS = 500;
+    private static final Object CFG_POLL_LOCK = new Object();
 
     /** Rewrite logging capped per package — W2 sits on a recursive hot path
      *  and must not flood logcat during rotation. */
@@ -1926,11 +1962,18 @@ public class MainHook implements IXposedHookLoadPackage {
      *  handleLoadPackage("android") the settings provider is not up yet, so
      *  the first read is deferred to the first hook call; a failed read
      *  stays unloaded and is retried on later calls (defaults meanwhile:
-     *  feature on, nothing excluded). A ContentObserver keeps both values
-     *  live — switch and exclusion list apply without any restart. */
+     *  feature on, nothing excluded). The private prefs file has no provider
+     *  dependency, so once the bridge is ready the read succeeds even early.
+     *
+     *  Immediacy: HookPrefs.reload() runs on every hook call behind a 500 ms
+     *  debounce (or immediately when the optional file-watcher listener set
+     *  the dirty flag). Only keys present in prefs are re-read; a key that is
+     *  still legacy-sourced keeps its startup value. */
     private static boolean freeRotOn() {
         if (!sysCfgReady) {
             ensureSysCfg();
+        } else {
+            pollCfgIfDue();
         }
         return cfgFreeRot;
     }
@@ -1947,56 +1990,69 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             sysCtx = ctx;
         }
-        try {
-            cfgFreeRot = Settings.System.getInt(ctx.getContentResolver(), KEY_FREE_ROT, 1) == 1;
-        } catch (Throwable t) {
-            return; // provider not up yet — retry later
+        if (!HookPrefs.ensureReady()) {
+            return; // retry on the next hook call
         }
-        cfgExclude = readExclude(ctx);
-        try {
-            if (cfgThread == null) {
-                cfgThread = new HandlerThread("CetusFreeRotCfg");
-                cfgThread.start();
-                cfgHandler = new Handler(cfgThread.getLooper());
-            }
-            ContentObserver obs = new ContentObserver(new Handler(cfgThread.getLooper())) {
-                @Override
-                public void onChange(boolean selfChange, Uri uri) {
-                    Context c = sysCtx;
-                    if (c == null) {
-                        return;
-                    }
-                    try {
-                        cfgFreeRot = Settings.System.getInt(
-                                c.getContentResolver(), KEY_FREE_ROT, 1) == 1;
-                    } catch (Throwable ignored) {
-                    }
-                    cfgExclude = readExclude(c);
-                    log("free-rot config reloaded: on=" + cfgFreeRot
-                            + " excluded=" + cfgExclude);
-                }
-            };
-            ctx.getContentResolver().registerContentObserver(
-                    Settings.System.getUriFor(KEY_FREE_ROT), false, obs);
-            ctx.getContentResolver().registerContentObserver(
-                    Settings.System.getUriFor(KEY_ROT_EXCLUDE), false, obs);
-        } catch (Throwable t) {
-            log("free-rot observer FAILED: " + t);
+        boolean needsLegacy = !HookPrefs.contains(KEY_FREE_ROT)
+                || !HookPrefs.contains(KEY_ROT_EXCLUDE);
+        if (needsLegacy && MixPrefs.isInPlaceUpgrade(ctx)
+                && !MixPrefs.legacyReadable(ctx)) {
+            return; // provider not up yet — retry, do not latch defaults
         }
+        cfgFreeRot = readInt(ctx, KEY_FREE_ROT, 1) == 1;
+        cfgExclude = ExcludeCodec.parse(readString(ctx, KEY_ROT_EXCLUDE));
+        ensureCfgThread();
+        HookPrefs.registerChangeListener();
         sysCfgReady = true;
-        log("free-rot config loaded: on=" + cfgFreeRot + " excluded=" + cfgExclude);
+        lastCfgPoll = SystemClock.uptimeMillis();
+        log("free-rot config loaded: on=" + cfgFreeRot + " excluded=" + cfgExclude
+                + " source=" + (HookPrefs.contains(KEY_FREE_ROT) ? "prefs" : "legacy/default"));
     }
 
-    /** Exclusion list reader via the shared ExcludeCodec (whitelist + drop
-     *  logging): Settings-stored values are untrusted — illegal segments
-     *  never reach match logic, let alone a later shell sink. Only
-     *  semantic: on the list = keep stock behavior. */
-    private static HashSet<String> readExclude(Context ctx) {
+    /** E0's allowlist sync is posted here; it is independent of the old
+     *  SettingsProvider ContentObserver and still needs a background looper
+     *  so PackageManager queries never run under the WMS lock. */
+    private static synchronized void ensureCfgThread() {
+        if (cfgThread != null) {
+            return;
+        }
         try {
-            return ExcludeCodec.parse(
-                    Settings.System.getString(ctx.getContentResolver(), KEY_ROT_EXCLUDE));
-        } catch (Throwable ignored) {
-            return new HashSet<String>();
+            cfgThread = new HandlerThread("CetusFreeRotCfg");
+            cfgThread.start();
+            cfgHandler = new Handler(cfgThread.getLooper());
+        } catch (Throwable t) {
+            log("free-rot cfg thread FAILED: " + t);
+        }
+    }
+
+    /** Debounced re-read of the two live keys. XSharedPreferences reload() is
+     *  a stat + parse only when the file changed, so 2 calls/s cost less than
+     *  any provider query; the dirty flag bypasses the wait when the
+     *  platform's watcher works. */
+    private static void pollCfgIfDue() {
+        boolean dirty = HookPrefs.takeDirty();
+        long now = SystemClock.uptimeMillis();
+        if (!dirty && now - lastCfgPoll < CFG_POLL_MS) {
+            return;
+        }
+        synchronized (CFG_POLL_LOCK) {
+            now = SystemClock.uptimeMillis();
+            if (!dirty && now - lastCfgPoll < CFG_POLL_MS) {
+                return;
+            }
+            lastCfgPoll = now;
+            HookPrefs.reload();
+            boolean on = HookPrefs.contains(KEY_FREE_ROT)
+                    ? HookPrefs.getInt(KEY_FREE_ROT, 1) == 1
+                    : cfgFreeRot; // still legacy/default — keep the startup value
+            HashSet<String> excluded = HookPrefs.contains(KEY_ROT_EXCLUDE)
+                    ? ExcludeCodec.parse(HookPrefs.getString(KEY_ROT_EXCLUDE, null))
+                    : cfgExclude;
+            if (on != cfgFreeRot || !excluded.equals(cfgExclude)) {
+                cfgFreeRot = on;
+                cfgExclude = excluded;
+                log("free-rot config reloaded: on=" + cfgFreeRot + " excluded=" + cfgExclude);
+            }
         }
     }
 

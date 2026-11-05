@@ -1,15 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="cetushome.rotationunlock"
-    android:versionCode="25"
-    android:versionName="1.8.4">
+    android:versionCode="26"
+    android:versionName="1.9.0">
 
     <uses-sdk android:minSdkVersion="27" android:targetSdkVersion="30" />
 
     <!-- Android 11+ 包可见性：排除清单的应用选择器需要完整已安装应用列表 -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
-    <!-- 设置页直写 Settings.System（app-op 授权一次，替代逐条 su 写入） -->
-    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+    <!-- 1.9.0 起配置存于模块私有 SharedPreferences，不再申请 WRITE_SETTINGS -->
 
     <application
         android:label="MixUnfold"
@@ -20,6 +19,11 @@
             android:value="MIX FOLD 1 (cetus): rotation unlock (launcher + unfolded lockscreen + inner-screen free rotation), per-orientation grid tuning, with control panel" />
         <meta-data android:name="xposedminversion" android:value="82" />
         <meta-data android:name="xposedscope" android:value="com.miui.home;com.android.systemui;android" />
+        <!-- LSPosed 新 XSharedPreferences：hook 进程经 lspd 读取模块私有 prefs
+             （classic 直读 app 数据目录被 SELinux 拦截，真机 LSPosed 2.2.1 实测）；
+             watcher 允许 hook 侧注册变更监听（不可用时 500ms 轮询兜底） -->
+        <meta-data android:name="xposedsharedprefs" android:value="true" />
+        <meta-data android:name="xposedsharedprefswatcher" android:value="true" />
 
         <activity
             android:name="cetushome.hook.MainActivity"

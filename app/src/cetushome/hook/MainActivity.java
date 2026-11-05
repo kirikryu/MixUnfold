@@ -2,11 +2,9 @@ package cetushome.hook;
 
 import android.app.Activity;
 import android.content.Intent;
-import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -28,10 +26,10 @@ import android.widget.ScrollView;
  * Single ScrollView page: the rotation master switch, the exclusion-list
  * entry (the app picker itself lives in AppPickerActivity — the inline list
  * made the main page unbearably long), and the legacy home-layout controls
- * with the launcher restart. Every change is written to Settings.System
- * immediately (debounced) through the shared persistent su shell — the
- * rotation switch applies live via the system_server ContentObserver, while
- * the launcher layout keys still need "重启系统桌面".
+ * with the launcher restart. Every change is written to the module's private
+ * SharedPreferences immediately (debounced) — no system settings permission,
+ * no shell. The rotation switch and exclusion list reach system_server within
+ * 500 ms; the launcher layout keys still need "重启系统桌面".
  */
 public class MainActivity extends Activity {
 
@@ -51,7 +49,7 @@ public class MainActivity extends Activity {
     private int cPrimary, cSecondary, cAccent;
 
     private TextView colsVal, status;
-    private Button excludeEntry, grantBtn;
+    private Button excludeEntry;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private Runnable pendingWrite;
@@ -65,6 +63,11 @@ public class MainActivity extends Activity {
         cSecondary = pal[1];
         cAccent = pal[2];
 
+        // One-time snapshot of the 1.8.x Settings.System keys on an in-place
+        // upgrade; a fresh install/reinstall gets defaults. Must run before
+        // the first read below.
+        MixPrefs.ensureMigrated(this);
+
         cols = read(KEY_COLUMNS, 3);
         landPages = read(KEY_LAND_PAGES, 3);
         padOpt = read(KEY_PAD_OPT, 0) == 1;
@@ -75,35 +78,10 @@ public class MainActivity extends Activity {
         updateExcludeCount();
     }
 
-    private void refreshGrantUi() {
-        if (grantBtn == null) {
-            return;
-        }
-        boolean ok = Settings.System.canWrite(this);
-        grantBtn.setVisibility(ok ? View.GONE : View.VISIBLE);
-        if (!ok) {
-            grantBtn.setText("① 点此授予「修改系统设置」权限（一次性，之后改动自动保存）");
-        }
-    }
-
-    private void launchWriteSettingsPage() {
-        try {
-            startActivity(new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS,
-                    Uri.parse("package:" + getPackageName())));
-        } catch (Throwable t) {
-            try {
-                startActivity(new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS));
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
     @Override
     protected void onResume() {
         super.onResume();
-        // the picker may have changed the exclusion key; the grant banner
-        // may need to disappear after the user flipped the app-op
-        refreshGrantUi();
+        // the picker may have changed the exclusion key
         updateExcludeCount();
     }
 
@@ -127,17 +105,6 @@ public class MainActivity extends Activity {
         sub.setTextSize(13);
         sub.setTextColor(cSecondary);
         h.addView(sub);
-
-        grantBtn = new Button(this);
-        grantBtn.setAllCaps(false);
-        grantBtn.setTextSize(14);
-        grantBtn.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                launchWriteSettingsPage();
-            }
-        });
-        h.addView(grantBtn);
-        refreshGrantUi();
 
         h.addView(makeGap());
 
@@ -298,7 +265,7 @@ public class MainActivity extends Activity {
         status.setTextSize(13);
         status.setTextColor(cSecondary);
         status.setPadding(0, dp(16), 0, 0);
-        status.setText("旋转开关与排除清单改动即时生效（首次改动会请求 root 授权）。\n"
+        status.setText("旋转开关与排除清单改动 ≤0.5 秒内生效。\n"
                 + "桌面布局项改动后需点「重启系统桌面」。");
         h.addView(status);
 
@@ -308,15 +275,9 @@ public class MainActivity extends Activity {
     // ---- main-page keys persistence -----------------------------------------
 
     private void updateExcludeCount() {
-        int n = 0;
-        String raw = readString(MainHook.KEY_ROT_EXCLUDE);
-        if (raw != null) {
-            for (String s : raw.split(";")) {
-                if (!s.trim().isEmpty()) {
-                    n++;
-                }
-            }
-        }
+        // parse through the same whitelist the hook uses, so the count never
+        // overstates the effective list
+        int n = ExcludeCodec.parse(readString(MainHook.KEY_ROT_EXCLUDE)).size();
         if (excludeEntry != null) {
             excludeEntry.setText("排除应用（已排除 " + n + " 个）▸");
         }
@@ -351,7 +312,7 @@ public class MainActivity extends Activity {
                     ui.post(new Runnable() {
                         @Override public void run() {
                             if (status != null) {
-                                status.setText("写入失败 — 请授予「修改系统设置」权限或检查 root 授权");
+                                status.setText("保存失败 — 请检查应用存储空间");
                             }
                         }
                     });
@@ -367,6 +328,10 @@ public class MainActivity extends Activity {
                 boolean ok = false;
                 String err = null;
                 try {
+                    // The only remaining shell call in the module: fixed
+                    // commands, no config/user data, user-initiated. Config
+                    // writes themselves never touch su (private prefs only).
+                    //
                     // Clean package-level stop + explicit relaunch. A raw
                     // Process.killProcess() inside the launcher leaves AMS
                     // state stale (skips fold/orientation callbacks) and
@@ -412,15 +377,11 @@ public class MainActivity extends Activity {
     // ---- settings reads & small builders --------------------------------------
 
     private int read(String key, int def) {
-        return Settings.System.getInt(getContentResolver(), key, def);
+        return MixPrefs.getInt(this, key, def);
     }
 
     private String readString(String key) {
-        try {
-            return Settings.System.getString(getContentResolver(), key);
-        } catch (Throwable t) {
-            return null;
-        }
+        return MixPrefs.getString(this, key, null);
     }
 
     private interface OnChange {

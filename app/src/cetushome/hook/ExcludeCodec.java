@@ -5,14 +5,15 @@ import java.util.HashSet;
 import java.util.regex.Pattern;
 
 /** Exclusion-list codec shared by the picker UI, the hook's config reader
- *  and the settings writer. Segments are ';'-joined Android package names.
+ *  and the prefs writer. Segments are ';'-joined Android package names.
  *
- *  Security: Settings.System is writable by any app holding the user-granted
- *  WRITE_SETTINGS app-op, so a stored value cannot be trusted. Every decode
+ *  Security: since 1.9.0 the value lives in the module's private prefs, but
+ *  it can still arrive from the legacy Settings.System migration or a
+ *  restored backup, so a stored value is not trusted blindly. Every decode
  *  (parse) and encode (join) pass keeps only [A-Za-z0-9_.]+ segments — a
- *  poisoned segment (e.g. a';id;echo ') must never survive into a root-shell
- *  write (RootWriter). Filtering runs at parse, at join and again inside
- *  SettingsWriter: defense in depth, no layer trusts its caller. */
+ *  malformed segment (e.g. a';id;echo ') is dropped and logged. Filtering
+ *  runs at parse, at join and again inside SettingsWriter: defense in depth,
+ *  no layer trusts its caller. */
 final class ExcludeCodec {
 
     private static final String TAG = "CetusHomeHook";

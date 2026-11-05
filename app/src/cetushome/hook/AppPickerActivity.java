@@ -8,7 +8,6 @@ import android.content.IntentFilter;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
-import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.Gravity;
@@ -33,20 +32,19 @@ import java.util.Locale;
  * the main panel. The whole page is ONE scroll container (a ListView whose
  * short header holds search / count / clear) so the cover screen can reach
  * the bottom without nested-scroll conflicts. Checking a row writes the
- * exclusion settings key immediately through the shared root shell — the
- * system_server side reloads it live, no restart.
+ * exclusion key to the module's private prefs immediately; system_server
+ * reloads it within 500 ms, no restart. The 1.8.1 polling read-back existed
+ * only for the asynchronous su path and is gone with it.
  */
 public class AppPickerActivity extends Activity {
 
     private int cPrimary, cSecondary, cAccent;
     private TextView excludeCount;
-    private Button grantBtn;
     private AppAdapter apps;
     private final HashSet<String> excluded = new HashSet<String>();
-    /** Serialized write+verify tasks; writeSeq guards stale verifications. */
+    /** Serialized prefs writes (off the UI thread). */
     private final java.util.concurrent.ExecutorService writeExec =
             java.util.concurrent.Executors.newSingleThreadExecutor();
-    private volatile int writeSeq;
     /** Loader generation: only the newest query may repaint the list. */
     private volatile int loadSeq;
     private BroadcastReceiver pkgObs;
@@ -60,8 +58,8 @@ public class AppPickerActivity extends Activity {
         cSecondary = pal[1];
         cAccent = pal[2];
 
-        String raw = Settings.System.getString(getContentResolver(),
-                MainHook.KEY_ROT_EXCLUDE);
+        MixPrefs.ensureMigrated(this);
+        String raw = MixPrefs.getString(this, MainHook.KEY_ROT_EXCLUDE, null);
         excluded.addAll(ExcludeCodec.parse(raw));
 
         apps = new AppAdapter();
@@ -83,25 +81,6 @@ public class AppPickerActivity extends Activity {
         note.setPadding(dp(2), dp(2), 0, 0);
         note.setText("清单内的应用保持原厂方向行为，其余跟随旋转；勾选即时生效，无需重启。");
         root.addView(note);
-
-        grantBtn = new Button(this);
-        grantBtn.setAllCaps(false);
-        grantBtn.setTextSize(14);
-        grantBtn.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                try {
-                    startActivity(new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS,
-                            android.net.Uri.parse("package:" + getPackageName())));
-                } catch (Throwable t) {
-                    try {
-                        startActivity(new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS));
-                    } catch (Throwable ignored) {
-                    }
-                }
-            }
-        });
-        root.addView(grantBtn);
-        refreshGrantUi();
 
         final EditText search = new EditText(this);
         search.setHint("搜索应用名或包名");
@@ -158,7 +137,6 @@ public class AppPickerActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        refreshGrantUi();
         // reload on every return: the picker often survives in background
         // while new apps are installed, and onCreate ran only once
         loadAppsAsync();
@@ -191,17 +169,6 @@ public class AppPickerActivity extends Activity {
     protected void onDestroy() {
         super.onDestroy();
         writeExec.shutdownNow();
-    }
-
-    private void refreshGrantUi() {
-        if (grantBtn == null) {
-            return;
-        }
-        boolean ok = Settings.System.canWrite(this);
-        grantBtn.setVisibility(ok ? View.GONE : View.VISIBLE);
-        if (!ok) {
-            grantBtn.setText("① 点此授予「修改系统设置」权限（一次性，勾选即可保存）");
-        }
     }
 
     private void loadAppsAsync() {
@@ -264,83 +231,28 @@ public class AppPickerActivity extends Activity {
 
     private void writeExclude() {
         final String value = joinExcluded();
-        final int seq = ++writeSeq;
         writeExec.execute(new Runnable() {
             @Override public void run() {
-                verifyWrite(seq, value);
-            }
-        });
-    }
-
-    /** Verify one exclusion write. The root-shell path lands the key
-     *  asynchronously (su spawn + `settings` CLI startup, tens to hundreds
-     *  of ms) while this thread reads back in ~1 ms — a single immediate
-     *  read-back raced every write and reverted each toggle, so checking or
-     *  unchecking never stuck. Poll the provider until it reflects the
-     *  write, retry once (a cold `su` can stall on the superuser prompt),
-     *  and only surface a mismatch for the newest write. */
-    private void verifyWrite(int seq, String value) {
-        boolean direct = SettingsWriter.put(this, MainHook.KEY_ROT_EXCLUDE, value);
-        HashSet<String> want = ExcludeCodec.parse(value);
-        HashSet<String> stored = settleRead(want, direct);
-        if (stored != null && !stored.equals(want) && seq == writeSeq) {
-            SettingsWriter.put(this, MainHook.KEY_ROT_EXCLUDE, value);
-            stored = settleRead(want, false);
-        }
-        final HashSet<String> storedF = stored;
-        runOnUiThread(new Runnable() {
-            @Override public void run() {
-                // what you see is what is stored; a newer toggle decides the
-                // state on its own, so a stale verification must not revert it
-                if (storedF == null || storedF.equals(excluded) || seq != writeSeq) {
-                    return;
-                }
-                excluded.clear();
-                excluded.addAll(storedF);
-                apps.notifyDataSetChanged();
-                updateCount();
-                Toast.makeText(AppPickerActivity.this,
-                        "写入未生效，请授予「修改系统设置」权限或检查 root 授权",
-                        Toast.LENGTH_LONG).show();
-            }
-        });
-    }
-
-    /** Read back until the provider shows `want` (direct provider writes
-     *  land synchronously; shell writes need a few rounds) or retries run
-     *  out — the last read is returned either way, null on interruption. */
-    private HashSet<String> settleRead(HashSet<String> want, boolean direct) {
-        int rounds = direct ? 2 : 10;
-        HashSet<String> now = null;
-        for (int i = 0; i < rounds; i++) {
-            if (i > 0) {
-                try {
-                    Thread.sleep(60);
-                } catch (InterruptedException e) {
-                    return null;
+                // commit() is synchronous, so no read-back loop is needed.
+                // A false return means the file could not be written.
+                if (!SettingsWriter.put(AppPickerActivity.this,
+                        MainHook.KEY_ROT_EXCLUDE, value)) {
+                    runOnUiThread(new Runnable() {
+                        @Override public void run() {
+                            Toast.makeText(AppPickerActivity.this,
+                                    "保存失败 — 请检查应用存储空间",
+                                    Toast.LENGTH_LONG).show();
+                        }
+                    });
                 }
             }
-            now = readStoredExclude();
-            if (now.equals(want)) {
-                break;
-            }
-        }
-        return now;
+        });
     }
 
     private String joinExcluded() {
         // re-validates every segment (ExcludeCodec.join): never trusts the
-        // set, which merges PackageManager names with Settings read-backs
+        // in-memory set
         return ExcludeCodec.join(excluded);
-    }
-
-    private HashSet<String> readStoredExclude() {
-        try {
-            return ExcludeCodec.parse(Settings.System.getString(getContentResolver(),
-                    MainHook.KEY_ROT_EXCLUDE));
-        } catch (Throwable ignored) {
-            return new HashSet<String>();
-        }
     }
 
     private static class AppItem {
