@@ -4,6 +4,20 @@
 版本历史自 v1.6.2 起（更早无记录）；每个版本的完整改动见
 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)。
 
+## [1.9.1] - 2026-11-06
+
+- 新增：设置备份（导入/导出）——控制面板底部「备份与恢复」可把全部
+  配置导出为文本备份文件（SAF 自选位置，无需存储权限），卸载重装/换机
+  前先导出、装回后导入。备份文件按不可信输入处理（`BackupCodec`：结构
+  校验 + 键白名单 + int 类型/范围校验，排除清单写入时再过
+  `ExcludeCodec`），导入只覆盖备份中出现的项；旋转与排除清单导入后
+  ≤0.5 秒生效，桌面布局项需重启系统桌面。不涉及任何钩子改动。
+- 变更（开发）：新增 `BackupCodec`（行式备份格式 v1 纯编解码，
+  `java.util` 实现、零 Android 依赖）与 `BackupCodecTest`（round trip、
+  结构拒绝、逐键丢弃、范围边界），`PrefsKeys` 新增 `validInt` 导入范围
+  守卫与 `MODULE_PKG` 常量；`run-tests.sh` 编译列表加入 `BackupCodec`。
+  真机验证（MIUI 文件选择器导出/导入、卸载重装→恢复全流程）待做。
+
 ## [1.9.0] - 2026-11-05
 
 - 安全修复：配置存储从 `Settings.System` 迁移到模块私有

@@ -55,6 +55,7 @@ mkdir -p "$OUT_DIR/shim" "$OUT_DIR/main" "$OUT_DIR/t"
     app/tests/shim/android/util/Log.java
 
 "$JDK_BIN/javac" --release 8 -encoding UTF-8 -cp "$AJ" -d "$OUT_DIR/main" \
+    app/src/cetushome/hook/BackupCodec.java \
     app/src/cetushome/hook/ExcludeCodec.java \
     app/src/cetushome/hook/PrefsKeys.java \
     app/src/cetushome/hook/PrefsMigration.java \

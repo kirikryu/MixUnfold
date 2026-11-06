@@ -2,6 +2,7 @@ package cetushome.hook;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -19,6 +20,9 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.widget.ScrollView;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Main control panel for the MixUnfold LSPosed module.
@@ -50,6 +54,15 @@ public class MainActivity extends Activity {
 
     private TextView colsVal, status;
     private Button excludeEntry;
+    // promoted from buildPage locals: an imported backup repaints these
+    private Switch rotSwitch, optSwitch, lockSwitch;
+    private Spinner pagesSpinner;
+    private SeekBar colsBar;
+    /** Guard: refreshUiFromPrefs() repaints widgets without scheduleWrite(). */
+    private boolean refreshing;
+
+    private static final int REQ_EXPORT = 1001;
+    private static final int REQ_IMPORT = 1002;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private Runnable pendingWrite;
@@ -85,6 +98,20 @@ public class MainActivity extends Activity {
         updateExcludeCount();
     }
 
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            return; // user cancelled the picker
+        }
+        final Uri uri = data.getData();
+        if (requestCode == REQ_EXPORT) {
+            exportTo(uri);
+        } else if (requestCode == REQ_IMPORT) {
+            importFrom(uri);
+        }
+    }
+
     private View buildPage() {
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
@@ -115,13 +142,16 @@ public class MainActivity extends Activity {
         rotName.setTextSize(15);
         h.addView(rotName);
 
-        final Switch rotSwitch = new Switch(this);
+        rotSwitch = new Switch(this);
         rotSwitch.setText("总开关");
         rotSwitch.setTextSize(15);
         rotSwitch.setTextColor(cPrimary);
         rotSwitch.setChecked(freeRot);
         rotSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
+                if (refreshing) {
+                    return;
+                }
                 freeRot = checked;
                 scheduleWrite();
             }
@@ -181,7 +211,7 @@ public class MainActivity extends Activity {
         pagesName.setTextSize(15);
         h.addView(pagesName);
 
-        Spinner pagesSpinner = new Spinner(this);
+        pagesSpinner = new Spinner(this);
         ArrayAdapter<String> adapter = new ArrayAdapter<String>(this,
                 android.R.layout.simple_spinner_item,
                 new String[]{"两页", "三页"});
@@ -206,13 +236,16 @@ public class MainActivity extends Activity {
         pagesNote.setText("桌面不足 5 页时选三页，末组可能不满——预期行为。");
         h.addView(pagesNote);
 
-        final Switch optSwitch = new Switch(this);
+        optSwitch = new Switch(this);
         optSwitch.setText("屏幕外侧边距优化");
         optSwitch.setTextSize(15);
         optSwitch.setTextColor(cPrimary);
         optSwitch.setChecked(padOpt);
         optSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
+                if (refreshing) {
+                    return;
+                }
                 padOpt = checked;
                 scheduleWrite();
             }
@@ -228,13 +261,16 @@ public class MainActivity extends Activity {
                 + "关闭：采用小米原版边距方案（原生边距与页缝保留）。");
         h.addView(optDesc);
 
-        final Switch lockSwitch = new Switch(this);
+        lockSwitch = new Switch(this);
         lockSwitch.setText("锁屏允许横屏");
         lockSwitch.setTextSize(15);
         lockSwitch.setTextColor(cPrimary);
         lockSwitch.setChecked(lockRot);
         lockSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
+                if (refreshing) {
+                    return;
+                }
                 lockRot = checked;
                 scheduleWrite();
             }
@@ -250,6 +286,40 @@ public class MainActivity extends Activity {
                 + "关闭并重启系统界面即恢复原版。\n"
                 + "折叠态外屏锁屏始终为竖屏，不受此开关影响。");
         h.addView(lockDesc);
+
+        h.addView(makeGap());
+
+        // ---- 备份与恢复 ------------------------------------------------------
+        TextView backupName = new TextView(this);
+        backupName.setText("备份与恢复");
+        backupName.setTextColor(cPrimary);
+        backupName.setTextSize(15);
+        h.addView(backupName);
+
+        Button exportBtn = makeButton("导出配置");
+        exportBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                startExport();
+            }
+        });
+        h.addView(exportBtn);
+
+        Button importBtn = makeButton("导入配置");
+        importBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                startImport();
+            }
+        });
+        h.addView(importBtn);
+
+        TextView backupDesc = new TextView(this);
+        backupDesc.setTextSize(13);
+        backupDesc.setTextColor(cSecondary);
+        backupDesc.setPadding(dp(8), dp(2), 0, 0);
+        backupDesc.setText("导出全部配置为文本备份文件，用于卸载重装或换机前保存；"
+                + "导入只覆盖备份中出现的项。旋转与排除清单导入后 ≤0.5 秒生效，"
+                + "桌面布局项需点「重启系统桌面」。");
+        h.addView(backupDesc);
 
         h.addView(makeGap());
 
@@ -319,6 +389,229 @@ public class MainActivity extends Activity {
                 }
             }
         }).start();
+    }
+
+    // ---- backup: SAF export / import ------------------------------------------
+    //
+    // The backup file is untrusted input: BackupCodec whitelists keys, type-
+    // and range-checks ints, and the exclude value is re-filtered by
+    // ExcludeCodec inside SettingsWriter. Import writes only keys present in
+    // the file (present wins — never replaces a stored value with a default).
+
+    private void startExport() {
+        String date = new java.text.SimpleDateFormat("yyyyMMdd",
+                java.util.Locale.US).format(new java.util.Date());
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("text/plain");
+        i.putExtra(Intent.EXTRA_TITLE,
+                "MixUnfold-backup-" + selfVersion() + "-" + date + ".txt");
+        try {
+            startActivityForResult(i, REQ_EXPORT);
+        } catch (Throwable t) {
+            // no documents provider on this device
+            status.setText("无法打开文件选择器：" + t);
+        }
+    }
+
+    private void startImport() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*"); // some providers mislabel .txt; the content validates
+        try {
+            startActivityForResult(i, REQ_IMPORT);
+        } catch (Throwable t) {
+            status.setText("无法打开文件选择器：" + t);
+        }
+    }
+
+    private void exportTo(final Uri uri) {
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final String err = doExport(uri);
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        if (status != null) {
+                            status.setText(err == null
+                                    ? "已导出配置备份。"
+                                    : "导出失败：" + err);
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private String doExport(Uri uri) {
+        try {
+            Map<String, String> values = new LinkedHashMap<String, String>();
+            for (String key : PrefsKeys.LEGACY_KEYS) {
+                if (PrefsKeys.KEY_ROT_EXCLUDE.equals(key)) {
+                    values.put(key, MixPrefs.getString(this, key,
+                            PrefsKeys.DEF_ROT_EXCLUDE));
+                } else {
+                    values.put(key, String.valueOf(
+                            MixPrefs.getInt(this, key, PrefsKeys.defaultInt(key))));
+                }
+            }
+            String text = BackupCodec.encode(PrefsKeys.MODULE_PKG, selfVersion(),
+                    System.currentTimeMillis(), values);
+            java.io.OutputStream os = getContentResolver().openOutputStream(uri);
+            if (os == null) {
+                return "无法打开目标文件";
+            }
+            try {
+                os.write(text.getBytes("UTF-8"));
+                os.flush();
+            } finally {
+                os.close();
+            }
+            return null;
+        } catch (Throwable t) {
+            return String.valueOf(t);
+        }
+    }
+
+    private void importFrom(final Uri uri) {
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final ImportResult r = doImport(uri);
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        if (status == null) {
+                            return;
+                        }
+                        if (r.error != null) {
+                            status.setText("导入失败：" + r.error);
+                            Toast.makeText(MainActivity.this,
+                                    "导入失败：" + r.error, Toast.LENGTH_LONG).show();
+                            return;
+                        }
+                        // a pending debounced write would overwrite the just-
+                        // imported values with the pre-import UI state
+                        if (pendingWrite != null) {
+                            ui.removeCallbacks(pendingWrite);
+                            pendingWrite = null;
+                        }
+                        refreshUiFromPrefs();
+                        int skipped = r.skippedUnknown + r.skippedInvalid;
+                        status.setText("已导入 " + r.applied + " 项"
+                                + (skipped > 0
+                                        ? "（跳过未知 " + r.skippedUnknown + " 项、"
+                                        + "非法 " + r.skippedInvalid + " 项）"
+                                        : "")
+                                + "。旋转与排除清单 ≤0.5 秒生效；"
+                                + "桌面布局项需重启系统桌面。");
+                        Toast.makeText(MainActivity.this,
+                                "已导入 " + r.applied + " 项",
+                                Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private static final class ImportResult {
+        String error;
+        int applied;
+        int skippedUnknown;
+        int skippedInvalid;
+    }
+
+    private ImportResult doImport(Uri uri) {
+        ImportResult r = new ImportResult();
+        try {
+            java.io.InputStream in = getContentResolver().openInputStream(uri);
+            if (in == null) {
+                r.error = "无法打开所选文件";
+                return r;
+            }
+            java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+            try {
+                byte[] chunk = new byte[8192];
+                int n;
+                while ((n = in.read(chunk)) > 0) {
+                    buf.write(chunk, 0, n);
+                    if (buf.size() > BackupCodec.MAX_CHARS) {
+                        r.error = BackupCodec.REJECT_TOO_LARGE;
+                        return r;
+                    }
+                }
+            } finally {
+                in.close();
+            }
+            BackupCodec.Parsed p = BackupCodec.parse(
+                    new String(buf.toByteArray(), "UTF-8"));
+            if (!p.ok()) {
+                r.error = p.rejectReason;
+                return r;
+            }
+            r.skippedUnknown = p.skippedUnknown;
+            r.skippedInvalid = p.skippedInvalid;
+            for (Map.Entry<String, String> e : p.values.entrySet()) {
+                boolean ok;
+                if (PrefsKeys.KEY_ROT_EXCLUDE.equals(e.getKey())) {
+                    ok = SettingsWriter.put(this, e.getKey(), e.getValue());
+                } else {
+                    ok = SettingsWriter.put(this, e.getKey(),
+                            Integer.parseInt(e.getValue()));
+                }
+                if (!ok) {
+                    r.error = "写入存储失败 — 请检查应用存储空间";
+                    return r;
+                }
+                r.applied++;
+            }
+            return r;
+        } catch (Throwable t) {
+            r.error = String.valueOf(t);
+            return r;
+        }
+    }
+
+    /** Repaint every control from the (possibly just-imported) stored values.
+     *  The refreshing guard keeps listeners from scheduling a write; the
+     *  spinner's own equality check covers its async callback. */
+    private void refreshUiFromPrefs() {
+        cols = read(KEY_COLUMNS, 3);
+        landPages = read(KEY_LAND_PAGES, 3);
+        padOpt = read(KEY_PAD_OPT, 0) == 1;
+        lockRot = read(KEY_LOCK_ROT, 1) == 1;
+        freeRot = read(KEY_FREE_ROT, 1) == 1;
+        refreshing = true;
+        try {
+            if (colsBar != null) {
+                colsBar.setProgress(cols - 2);
+            }
+            if (colsVal != null) {
+                colsVal.setText(String.valueOf(cols));
+            }
+            if (pagesSpinner != null) {
+                pagesSpinner.setSelection(landPages == 3 ? 1 : 0);
+            }
+            if (rotSwitch != null) {
+                rotSwitch.setChecked(freeRot);
+            }
+            if (optSwitch != null) {
+                optSwitch.setChecked(padOpt);
+            }
+            if (lockSwitch != null) {
+                lockSwitch.setChecked(lockRot);
+            }
+            updateExcludeCount();
+        } finally {
+            refreshing = false;
+        }
+    }
+
+    private String selfVersion() {
+        try {
+            String v = getPackageManager()
+                    .getPackageInfo(getPackageName(), 0).versionName;
+            return v == null ? "unknown" : v;
+        } catch (Throwable t) {
+            return "unknown";
+        }
     }
 
     private void restartLauncher() {
@@ -399,6 +692,7 @@ public class MainActivity extends Activity {
         val.setTextSize(14);
 
         SeekBar bar = new SeekBar(this);
+        colsBar = bar; // single caller: the columns slider needs import repaint
         bar.setMax(max - min);
         bar.setProgress(value - min);
         bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {

@@ -11,6 +11,8 @@ package cetushome.hook;
 final class PrefsKeys {
 
     static final String PREFS_NAME = "mixunfold_prefs";
+    /** Module identity, shared with the backup format's pkg gate. */
+    static final String MODULE_PKG = "cetushome.rotationunlock";
     /** Written by the app once the legacy snapshot has been handled. */
     static final String KEY_MIGRATED = "mixunfold_migrated_v1";
 
@@ -75,6 +77,29 @@ final class PrefsKeys {
             return DEF_FREE_ROT;
         }
         return -1;
+    }
+
+    /** Per-key legal domain for int values arriving from an untrusted source
+     *  (a restored backup file). The hook side does no range defense, so an
+     *  out-of-domain value must never be written. Bounds mirror the control
+     *  panel's writable ranges; the padding keys get a deliberately loose
+     *  band — today's UI derives 0/120/280, the point is rejecting absurd
+     *  values, not pinning today's UI. Unknown keys are always invalid. */
+    static boolean validInt(String key, int v) {
+        if (KEY_COLUMNS.equals(key)) {
+            return v >= 2 && v <= 6;
+        }
+        if (KEY_LAND_PAGES.equals(key)) {
+            return v == 2 || v == 3;
+        }
+        if (KEY_PAD_OPT.equals(key) || KEY_LOCK_ROT.equals(key)
+                || KEY_FREE_ROT.equals(key)) {
+            return v == 0 || v == 1;
+        }
+        if (KEY_PAD_PORT.equals(key) || KEY_PAD_LAND.equals(key)) {
+            return v >= 0 && v <= 10000;
+        }
+        return false;
     }
 
     private PrefsKeys() {

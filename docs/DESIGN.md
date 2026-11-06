@@ -788,3 +788,61 @@ AppPickerActivity / PrefsKeys / ExcludeCodec / AndroidManifest）。与
 终态扫描结论同源一致。照例声明：0 finding 是本轮静态深扫的密封结论，
 佐证迁移消除了既有危险项，不等同于"项目无风险"（静态覆盖边界见第
 13 节 Seal 语义与 completeness 说明）。
+
+## 16. 设置备份（导入/导出，1.9.1）
+
+**动因**：1.9.0 起配置存于模块私有 SharedPreferences 且清单声明
+`allowBackup="false"`——平台自动备份/换机迁移没有，卸载重装配置归零；
+而「官方版与本地构建版签名不一致必须卸载重装」是 README FAQ 的官方
+场景。1.9.1 补上手动导出/导入：用户在卸载重装/换机前经 SAF 自选位置
+导出文本备份，装回后导入恢复。
+
+**边界**：纯 app 侧功能，不涉及任何钩子（第 3 节清单不变）；SAF
+（`ACTION_CREATE_DOCUMENT` / `ACTION_OPEN_DOCUMENT`）无需存储权限；写入
+仍只走 `SettingsWriter → MixPrefs`，无新 exec、无配置值流向 shell。
+
+**格式 v1**（`BackupCodec`，行式纯文本、UTF-8、容忍 BOM/CRLF/空白行，
+首个非空行必须为魔数行）：
+
+```
+MixUnfold config backup
+schema=1                      格式门：>1 整文件拒绝（提示先升级模块）
+pkg=cetushome.rotationunlock  来源门：必须与本模块包名一致
+version=1.9.1                 信息性
+exportedAt=<millis>           信息性
+<key>=<value>                 8 个配置键，LEGACY_KEYS 顺序
+```
+
+选行式而非 JSON 的原因：排除清单值被 `ExcludeCodec` 保证只含
+`[A-Za-z0-9_.;]`，行式无需转义；`BackupCodec` 因此是纯 `java.util` 类，
+JVM 回归无需 android.jar 或 org.json shim（org.json 在 android.jar 内是
+stub，走 JSON 即破坏零依赖测试约定）。
+
+**威胁模型**：备份文件是**不可信输入**（用户经 SAF 选择，可能被手改或
+来自陌生来源）。四层校验，层间不互信：
+
+| 层 | 位置 | 行为 |
+|---|---|---|
+| ① 结构 | `BackupCodec.parse` | 魔数 / schema / pkg / 无 `=` 行 / 重复键 / 超 64 KiB → 整文件拒绝并报告原因 |
+| ② 键白名单 | `BackupCodec.parse` | 非 `PrefsKeys.LEGACY_KEYS` 键丢弃计数（schema=1 向前兼容加键），不整拒 |
+| ③ 类型+范围 | `BackupCodec.parse` + `PrefsKeys.validInt` | int 键必须可解析且在合法域内（columns 2–6、landPages 2\|3、布尔键 0\|1、pad 0..10000 宽松带），否则丢弃计数；hook 侧无范围防御，越界值绝不落盘 |
+| ④ 写入过滤 | `SettingsWriter.putString` | exclude 值写入时再过一次 `ExcludeCodec`（1.9.0 已有，注释点名 restored backup） |
+
+`KEY_MIGRATED` 是内部迁移状态，不进备份、不可导入。导入语义为
+**present-wins**：只覆盖备份中出现的键，缺失键不动——与
+`ensureMigrated` 的 contains 哲学一致，永不悄悄用默认值覆盖已存值。
+
+**UI 与生效**：MainActivity 底部新增「备份与恢复」区（导出/导入两按钮，
+SAF 回调在工作线程读写流，读取限长 64 KiB）。导入成功后取消待执行的
+去抖写入（否则 400 ms 后旧 UI 状态覆盖刚导入的值），再
+`refreshUiFromPrefs()` 回读刷新控件（`refreshing` 守卫 + spinner 既有
+相等判断避免回环写）。生效链路无新工作：`cetus_free_rot` / 排除清单
+≤0.5 s（第 15 节 watcher/轮询），布局键复用「重启系统桌面」。
+
+**测试**：`BackupCodecTest`（round trip、结构拒绝、逐键丢弃、
+`validInt` 边界、CRLF/BOM/空白行容忍）；`run-tests.sh` 编译列表加入
+`BackupCodec`。真机验证（TODO）：MIUI 文件选择器导出/导入、卸载重装→
+导入恢复全流程、导入后生效时序。
+
+**Mimosa 预判**：纯 app 侧改动、无新权限与污点汇点（备份解析不流向任何
+exec）；复扫回执待发布后补记。
