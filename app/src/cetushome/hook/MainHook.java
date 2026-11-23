@@ -113,7 +113,13 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * (evaluation and write path), which E1 bridges: E1a opens the embedding
  * controller's compiled-off rotation gate for rule-true embedded apps, E1b
  * neutralizes runtime orientation requests from parallel-window records
- * (the WeChat-article-page portrait stick). The legacy W1-W5 hand-written
+ * (the WeChat-article-page portrait stick). The engine's write path proved
+ * to cover only construction-time manifest orientations — runtime requests
+ * from plain fullscreen records stood untouched (2026-11-22, parallel view
+ * off) — so E2/E3 re-answer any app-forced PORTRAIT-family request as
+ * "follow" at the read points both display rotation and config propagation
+ * consult: form-independent, stateless, exclusion restores stock
+ * instantly. The legacy W1-W5 hand-written
  * read/write point rewrites remain
  * in the source as a fallback for ROMs without the engine impl class; on
  * those, the unfolded inner display follows auto-rotate for every
@@ -1455,10 +1461,13 @@ public class MainHook implements IXposedHookLoadPackage {
      *    magic-window mode 101 — split-screen, freeform and PIP keep stock;
      *    fullscreen records stay with the engine's own path), unfolded, not
      *    MIUI size-compat; engine case-1 parity double-write (args[0]=-1 +
-     *    info.screenOrientation=-1). Registered in ROT_REG so
-     *    restoreStockOrientation re-issues the original request when the
-     *    switch goes off or the package is excluded — the hook then no-ops
-     *    because its gates fail.
+     *    info.screenOrientation=-1). Registered in ROT_REG only as bookkeeping:
+     *    in engine mode nothing walks the registry to restore (the
+     *    restoreStockOrientation callers live in the unregistered legacy
+     *    W2/W3), so a switch-off/exclusion reaches standing pins through the
+     *    E2/E3 read-point gates instead; records already absorbed keep -1
+     *    until the app re-issues or the activity is recreated (same known
+     *    residual family as the engine's own allowlist staleness).
      */
     private static void hookEmbeddingRotation(XC_LoadPackage.LoadPackageParam lpp) {
         final Class<?> ctrlCls;
@@ -1599,6 +1608,176 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
+     * E2/E3 — read-point portrait-pin mask (1.9.2). On-device evidence
+     * (2026-11-22): the engine's write path only neutralizes
+     * construction-time (manifest-declared) orientations — Settings'
+     * manifest PORTRAIT is ctor-neutralized with the engine's
+     * Inner/Outer signature, but a runtime setRequestedOrientation call
+     * from a manifest-UNSPECIFIED record stands untouched (WeChat article
+     * page with MIUI parallel view off: mOrientation=PORTRAIT standing,
+     * display dragged back to portrait). E1b covers that at the write
+     * point only for embedding-organized panes; plain fullscreen records
+     * fall through both layers. Instead of another write-point branch,
+     * the mask sits at the single evaluation choke point that display
+     * rotation (E2: ActivityRecord.getOrientation) and config
+     * propagation (E3: getRequestedConfigurationOrientation — else the
+     * window renders portrait inside an already-rotated display, legacy
+     * W3's lesson) both consult: an app-forced PORTRAIT-family answer is
+     * re-answered "unspecified" so the display follows the sensor.
+     * No record state is written, so exclusion restores stock instantly
+     * (nothing to undo) and the engine keeps owning ctor-time handling
+     * (starting windows stay flash-free). Gates, cheapest first: result
+     * predicate (a: portrait-pin family only — USER/LOCKED are the
+     * user's rotation-lock will, the landscape family passes per the
+     * engine's own philosophy), switch (d), camera/excluded (c/e —
+     * reachability of the stock answer), ROM-global fold state (f), form
+     * scope (g: fullscreen + panes, system split-screen/freeform/PIP
+     * keep stock). Semantics live in OrientationPolicy, JVM-tested. */
+    private static void hookReadPointMask(XC_LoadPackage.LoadPackageParam lpp) {
+        final Class<?> actRecCls;
+        final Class<?> wcCls;
+        try {
+            actRecCls = XposedHelpers.findClass(
+                    "com.android.server.wm.ActivityRecord", lpp.classLoader);
+            wcCls = XposedHelpers.findClass(
+                    "com.android.server.wm.WindowContainer", lpp.classLoader);
+        } catch (Throwable t) {
+            log("E2 unavailable (ActivityRecord/WindowContainer): " + t);
+            return;
+        }
+        // E2 — display-rotation preference read point. This ROM overrides
+        // getOrientation(int) on ActivityRecord without calling super, so the
+        // WindowContainer base version never fires for activities (verified
+        // while building legacy W2, same target).
+        try {
+            XposedHelpers.findAndHookMethod(actRecCls, "getOrientation",
+                    int.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                int cur = (Integer) param.getResult();
+                                if (!OrientationPolicy.isPortraitPin(cur)) {
+                                    return; // a: follow / user-will / landscape pass
+                                }
+                                if (!freeRotOn()) {
+                                    return; // d
+                                }
+                                Object r = param.thisObject;
+                                String pkg = pkgOf(r);
+                                if (pkg == null || CAMERA_PKGS.contains(pkg)
+                                        || cfgExclude.contains(pkg)) {
+                                    return; // c/e — the stock answer stands
+                                }
+                                if (foldedGlobal(r)) {
+                                    return; // f — cover display never masked
+                                }
+                                if (!maskScope(r)) {
+                                    return; // g — system multi-window keeps stock
+                                }
+                                param.setResult(OrientationPolicy.UNSPECIFIED);
+                                logRewrite("E2", pkg);
+                            } catch (Throwable t) {
+                                // any failure keeps the stock result
+                            }
+                        }
+                    });
+            log("hook E2 ok: getOrientation portrait-pin mask");
+        } catch (Throwable t) {
+            log("hook E2 FAILED: " + t);
+        }
+        // E3 — config-orientation read point, record variant only. The
+        // stock result maps the record's orientation to
+        // ORIENTATION_PORTRAIT/LANDSCAPE only when a fixed orientation is
+        // requested; the mask rewrites the portrait case to UNDEFINED so the
+        // handed configuration agrees with the freed display.
+        try {
+            XposedHelpers.findAndHookMethod(wcCls, "getRequestedConfigurationOrientation",
+                    boolean.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            try {
+                                if (!actRecCls.isInstance(param.thisObject)) {
+                                    return;
+                                }
+                                if (Boolean.TRUE.equals(param.args[0])) {
+                                    return; // display-level variant — no activity
+                                }
+                                if ((Integer) param.getResult() != 1) {
+                                    return; // a mapped: ORIENTATION_PORTRAIT only
+                                }
+                                if (!freeRotOn()) {
+                                    return; // d
+                                }
+                                Object r = param.thisObject;
+                                String pkg = pkgOf(r);
+                                if (pkg == null || CAMERA_PKGS.contains(pkg)
+                                        || cfgExclude.contains(pkg)) {
+                                    return; // c/e
+                                }
+                                if (foldedGlobal(r)) {
+                                    return; // f
+                                }
+                                if (!maskScope(r)) {
+                                    return; // g
+                                }
+                                param.setResult(0); // Configuration.ORIENTATION_UNDEFINED
+                                logRewrite("E3", pkg);
+                            } catch (Throwable t) {
+                                // any failure keeps the stock result
+                            }
+                        }
+                    });
+            log("hook E3 ok: getRequestedConfigurationOrientation portrait-pin mask");
+        } catch (Throwable t) {
+            log("hook E3 FAILED: " + t);
+        }
+    }
+
+    /** f-gate for the read-point mask: ROM-global fold state only. The
+     *  per-record smallestScreenWidthDp backstop (legacy folded()) reads a
+     *  pane's merged sw338dp as "folded" and would close the mask on
+     *  exactly the pane records it must cover (the E1b lesson); the fold
+     *  state is one physical fact. Any failure closes to "no mask",
+     *  keeping the cover-screen guarantee. */
+    private static boolean foldedGlobal(Object r) {
+        try {
+            Object policy = XposedHelpers.getObjectField(
+                    XposedHelpers.getObjectField(
+                            XposedHelpers.getObjectField(r, "mAtmService"), "mWindowManager"),
+                    "mPolicy");
+            return (Boolean) XposedHelpers.callMethod(policy, "isDisplayFolded");
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** g-gate for the read-point mask: plain fullscreen or embedding-
+     *  organized pane (or magic-window mode 101) — system split-screen /
+     *  freeform / PIP keep their own orientation governance. Reflection
+     *  failures pass conservative defaults so the scope closes. */
+    private static boolean maskScope(Object r) {
+        boolean multiWindow = true;
+        try {
+            multiWindow = (Boolean) XposedHelpers.callMethod(r, "inMultiWindowMode");
+        } catch (Throwable ignored) {
+        }
+        boolean embedded = false;
+        try {
+            embedded = (Boolean) XposedHelpers.callMethod(r, "isEmbedded");
+        } catch (Throwable ignored) {
+        }
+        int mode = 0;
+        try {
+            Object m = XposedHelpers.callMethod(r, "getWindowingMode");
+            if (m instanceof Integer) {
+                mode = (Integer) m;
+            }
+        } catch (Throwable ignored) {
+        }
+        return OrientationPolicy.inMaskScope(multiWindow, embedded, mode);
+    }
+
+    /**
      * W1/W2(/W3) — make every registered app follow rotation on the unfolded
      * inner display. Gate order below is part of the spec (cheapest first):
      *  a) requested/current ∉ {UNSPECIFIED(-1), UNSET(-2), BEHIND(3)} — the
@@ -1624,6 +1803,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void hookSystemServer(XC_LoadPackage.LoadPackageParam lpp) {
         if (hookEngineMode(lpp)) {
             hookEmbeddingRotation(lpp);
+            hookReadPointMask(lpp);
             log("system_server: ENGINE MODE active (W1-W5 superseded, not registered)");
             return;
         }

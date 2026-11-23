@@ -4,6 +4,29 @@
 版本历史自 v1.6.2 起（更早无记录）；每个版本的完整改动见
 [GitHub Releases](https://github.com/kirikryu/MixUnfold/releases)。
 
+## [1.9.2] - 2026-11-23
+
+- 修复：系统设置里关闭微信"平行视窗"后，横屏下打开公众号文章会自动转回
+  竖屏、需重新横置设备才恢复。真机定性（2026-11-22）：引擎的写点中和只
+  覆盖构造期 manifest 声明的方向，运行期 `setRequestedOrientation`
+  请求原样站立；E1b 又只认嵌入窗格，纯全屏记录两头落空。修复为**读点
+  竖屏钉普适掩码**（E2 `ActivityRecord.getOrientation` / E3
+  `getRequestedConfigurationOrientation`，legacy W2/W3 同目标点的新语义）：
+  展开内屏上应用强制的竖屏钉（PORTRAIT/NOSENSOR/SENSOR_PORTRAIT/
+  REVERSE_PORTRAIT）在读点改答"跟随旋转"——形态无关、零改写、排除清单
+  变更瞬间回原厂；USER/LOCKED（用户旋转锁意愿）与显式横屏请求全部放行，
+  视频全屏按钮/横屏游戏行为不变；系统分屏/小窗/PIP 保持原厂（机主确认）。
+- 变更（开发）：新增 `OrientationPolicy`（竖屏钉判定 + 形态范围纯逻辑，
+  JVM 回归 `OrientationPolicyTest`）；DESIGN §11 修正两处 1.9.0 时代的
+  反编译推断——E1b 命中谓词实际只有 `isEmbedded()`（微信 magic-window
+  窗格 windowingMode 从不为 101）、引擎模式并无还原路径
+  （`restoreStockOrientation` 调用点全在未注册的 legacy W2/W3）；
+  补记 2026-11-22 侦察证据（设置应用 Inner/Outer 签名对照组、微信任务
+  TaskFragment 结构、"排除后无请求记录仍跟随"边界）。
+- 已知边界：从未发过方向请求的应用（如微信聊天主窗格）跟随的是被引擎
+  放开的显示旋转，排除清单对它们无感（"排除=原厂"仅在"原厂=请求站立"
+  意义下成立）；要不要为排除应用主动加钉属后续产品决策。
+
 ## [1.9.1] - 2026-11-06
 
 - 新增：设置备份（导入/导出）——控制面板底部「备份与恢复」可把全部

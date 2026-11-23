@@ -394,10 +394,19 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
     WindowContainer)`（legacy W1 的引擎模式孪生）：请求 ∉ {-1,-2,3}、总开关
     开、非相机、非排除、**平行窗口记录**（live `isEmbedded()` 或 magic-window
     窗口模式 101 "miui-magic-windows"；分屏/小窗/PIP 与全屏记录不命中——
-    全屏记录归引擎自身写路径管）且非折叠、非 size-compat 时双写中和
-    （`args[0]=-1` + `info.screenOrientation=-1`，引擎 case-1 等效），计入
-    `ROT_REG`；总开关关闭/排除变更时经 `restoreStockOrientation` 重发原请求
-    即时还原（钩子门控失效后自然放行）。**折叠门教训**：平行窗口窗格的合并
+    全屏记录的运行期请求由 E2/E3 读点掩码兜底，见下）且非折叠、非
+    size-compat 时双写中和（`args[0]=-1` + `info.screenOrientation=-1`，
+    引擎 case-1 等效），计入 `ROT_REG`。**2026-11-22 真机修正**（两处，
+    原表述系反编译推断、未经运行期验证）：
+    ① 命中谓词实际只有 `isEmbedded()`——微信 magic-window 任务是
+    **fullscreen 任务 + 嵌入 organizer 接管的 TaskFragment 窗格**（窗格
+    mode=multi-window(6)，文章页碎片甚至带全屏边界），窗格自身
+    windowingMode 从不等于 101，`==101` 分支从未命中；
+    ② 引擎模式没有注册任何还原路径（`restoreStockOrientation` 的调用点
+    全在未注册的 legacy W2/W3 里，E1b 原注释"排除变更时重发原请求即时
+    还原"不成立），存量已中和记录保持 -1 直到应用重发或 activity 重建；
+    站立钉的排除语义由 E2/E3 读点门控即时提供（见下），已吸收记录的
+    残留与本节末"已知限制"同族。**折叠门教训**：平行窗口窗格的合并
     配置 `smallestScreenWidthDp≈338dp`（窄竖栏），第 10 节 f 门的"per-record
     sw<600 视为折叠外屏"判定会把展开内屏上的窗格记录**误判为折叠**导致改写
     永不命中——E1b 的折叠门只查 ROM 全局折叠态
@@ -405,6 +414,35 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
     跳过，外屏保障不变。即时性与允许表不同：写点/读点逐次求值、无持久状态，
     总开关与排除清单变更即时生效。
   - 仅引擎模式注册（legacy W1–W5 的 g 门本就放行嵌入记录，再挂会双重接管）。
+  - **E2/E3（读点竖屏钉普适掩码，1.9.2）**：2026-11-22 真机证据链——引擎的
+    写点中和**只覆盖构造期（manifest 声明）方向**：对照组设置应用（manifest
+    PORTRAIT）构造期即被引擎拆写 `mScreenOrientationInner=UNSPECIFIED /
+    Outer=PORTRAIT`（内外屏分离签名字段，引擎实锤在工作）；而微信文章页
+    （manifest UNSPECIFIED，构造期无事可做）在平行视窗关闭、记录退为纯全屏后，
+    运行期 `setRequestedOrientation(PORTRAIT)` **原样站立**（`mOrientation=1`、
+    无 Inner/Outer 签名、无 TaskFragment → `isEmbedded()` 亦 false，E1b 双双
+    失守），把整个显示拖回竖屏——即"关掉平行视窗后文章页钉竖屏"病灶。
+    据此放弃继续在写点按窗口形态分支补丁，改为在**读点**（形态无关的唯一
+    咽喉）挂普适规则：E2 hook `ActivityRecord.getOrientation(int)`（喂显示
+    旋转决策，同 legacy W2 目标点）、E3 hook
+    `WindowContainer.getRequestedConfigurationOrientation(boolean)`（喂应用
+    收到的配置，防"显示已转、窗口仍竖"错位，同 legacy W3 教训；仅记录
+    变体）。命中谓词与形态范围抽入 `OrientationPolicy`（纯逻辑，JVM 回归）：
+    - **只拦应用强制的竖屏钉**（PORTRAIT(1)/NOSENSOR(5)/SENSOR_PORTRAIT(7)/
+      REVERSE_PORTRAIT(9)；E2 改答 UNSPECIFIED(-1)、E3 改答
+      ORIENTATION_UNDEFINED）。USER/LOCKED/USER_PORTRAIT 是用户自身旋转锁
+      意愿，不拦；横屏一族全放行——镜像引擎"解除竖屏锁、尊重显式横屏"的
+      哲学（机主确认），视频全屏按钮/横屏游戏行为不变；
+    - **形态范围**：全屏记录与嵌入窗格（`isEmbedded()` 或模式 101）在网内，
+      系统分屏/小窗/PIP（多窗口且非嵌入）保持原厂——与引擎豁免区、legacy
+      g 门边界一致（机主确认）；反射失败传保守默认值，范围一律闭合；
+    - **门控**（最便宜在前）：结果判定 → 总开关 → 相机/排除 → **仅 ROM
+      全局折叠态**（吸取 E1b 折叠门教训，不查 per-record sw）→ 形态范围；
+      任何异常保留原值；
+    - **零改写、零登记**：不动任何记录字段 → 排除清单变更**瞬间**回原厂
+      （站立钉立刻重新生效），E1b 还原路径缺失不再有行为影响；非竖屏钉
+      结果在热路径只付一次 int 比较。
+  - 同仅引擎模式注册（legacy W2/W3 未挂，读点不双注册）。
 - **总开关语义**：关 → `isEnabled()` 恢复 false → 引擎休眠、全机原厂
   （允许表文件残留但引擎不读，无行为影响）。
 - **已知限制（排除清单变更需重启才完美应用，机主标记待修）**：引擎在
@@ -413,7 +451,13 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
   即时性都不完整：
   1. 新装应用不在允许表 → 不跟随（需重启或任意排除变更触发重建）；
   2. 新排除的应用此前已被中和 → 存量 ActivityRecord 仍保持跟随（需重启
-     或该记录重建）。
+     或该记录重建）；
+  3. E2/E3 之后的边界（2026-11-22）：站立竖屏钉的排除/关闭语义已即时
+     （读点门控逐次求值），但 (a) 引擎/E1b **已中和**的存量记录保持 -1
+     直到记录重建（上文 2 的同族）；(b) 从未发过方向请求的 UNSPECIFIED
+     记录跟随的是被引擎放开的显示旋转，排除清单对它们无感（机主实测：
+     排除微信后平行窗格主界面仍能横）——"排除=原厂"仅在"原厂=请求站立"
+     的意义下成立，要不要为排除应用**主动加钉**属后续产品决策。
   修复方向：排除变更时按允许表 diff 对存量记录做**反向还原**（等价于
   第 10 节 W2 时代的 `restoreStockOrientation`：把 `info.screenOrientation`
   /`mOrientation` 写回原厂值，该实现仍在引擎模式的回退代码里可复用）；
