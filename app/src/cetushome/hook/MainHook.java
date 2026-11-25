@@ -60,13 +60,30 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *     a trailing EMPTY page is never touched (it may be stock's drag-to-edge
  *     anticipation page or one the user just added). Re-entrancy-guarded and
  *     deferred past stock reorder callbacks — an inline re-entry used to
- *     read the pre-mutation count and pad twice in one event.
+ *     read the pre-mutation count and pad twice in one event. The policy is
+ *     part of 「外侧边距优化」 (reverse alignment needs complete pairs; stock
+ *     margins do not) but can also be requested on its own with
+ *     cetushome_always_pad for users who want pairs regardless; both
+ *     switches off means stock paging — nothing padded — and the veto of
+ *     15/16 is off too. Both halves share one gate, PageParity.policyActive;
+ *     landscape three-page mode is exempt in every combination.
  *  13b. Launcher.onConfigurationChanged / onResume: re-run the orientation
  *     request decision. The launcher declares every config change (never
  *     recreates) and stock RotationHelper.onConfigurationChanged is an
  *     empty stub — so a fold transition never re-issued the request and the
  *     sensor-following request from the unfolded session stayed active on
  *     the cover screen (outer-screen rotation, fixed by 1b + 13b together).
+ *  15/16. Workspace.deleteScreen / removeScreen: even-page veto, the other
+ *     half of the policy above. Stock prunes a trailing blank page after
+ *     every drop animation, on edit-mode entry/exit and on load — it only
+ *     keeps one while items are checked in multi-select. Removing the
+ *     trailing blank page is vetoed when that would break the snap-unit
+ *     parity and the page before it carries content (the shape
+ *     ensureEvenPages appends): at deleteScreen (reached before any
+ *     mutation) whenever stock is not dragging, at removeScreen (reached
+ *     after the DB row is gone) only in editing layout mode. A page
+ *     carrying content always passes. Stock path and gate rationale:
+ *     PageParity, §12.
  *  17. ItemInfo.load: runtime widget shrink. Rows authored for the stock
  *      4-column grid (a full-width 2x4 widget, or anything at cellX>=1)
  *      overflow the narrowed grid: CellLayout.updateCellOccupiedMarks
@@ -151,6 +168,7 @@ public class MainHook implements IXposedHookLoadPackage {
     public static final String KEY_PAD_LAND = PrefsKeys.KEY_PAD_LAND;
     public static final String KEY_LAND_PAGES = PrefsKeys.KEY_LAND_PAGES;
     public static final String KEY_PAD_OPT = PrefsKeys.KEY_PAD_OPT;
+    public static final String KEY_ALWAYS_PAD = PrefsKeys.KEY_ALWAYS_PAD;
     public static final String KEY_LOCK_ROT = PrefsKeys.KEY_LOCK_ROT;
     public static final String KEY_FREE_ROT = PrefsKeys.KEY_FREE_ROT;
     public static final String KEY_ROT_EXCLUDE = PrefsKeys.KEY_ROT_EXCLUDE;
@@ -166,6 +184,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static int cfgPadLand = 120;
     private static int cfgLandPages = 3;
     private static boolean cfgPadOpt;
+    private static boolean cfgAlwaysPad;
 
     // true while ensureEvenPages is mutating the workspace. insertNewScreen/
     // removeScreen can re-enter this hook synchronously through stock's own
@@ -219,10 +238,11 @@ public class MainHook implements IXposedHookLoadPackage {
         cfgPadLand = readInt(ctx, KEY_PAD_LAND, 120);
         cfgLandPages = readInt(ctx, KEY_LAND_PAGES, 3);
         cfgPadOpt = readInt(ctx, KEY_PAD_OPT, 0) == 1;
+        cfgAlwaysPad = readInt(ctx, KEY_ALWAYS_PAD, 0) == 1;
         cfgLoaded = true;
         log("config loaded: columns=" + cfgColumns + " padPort=" + cfgPadPort
                 + " padLand=" + cfgPadLand + " landPages=" + cfgLandPages
-                + " padOpt=" + cfgPadOpt
+                + " padOpt=" + cfgPadOpt + " alwaysPad=" + cfgAlwaysPad
                 + " source=" + (HookPrefs.contains(KEY_COLUMNS) ? "prefs" : "legacy/default"));
     }
 
@@ -831,13 +851,38 @@ public class MainHook implements IXposedHookLoadPackage {
             log("hook 11/12 FAILED: " + t);
         }
 
+        // 11c. Launcher.finishLoading: one more parity check once the
+        // workspace has actually been populated. Every other trigger
+        // (resume, config change, reorder) fires during the load, while the
+        // CellLayouts are still empty — an odd count at process start then
+        // read as "trailing blank page" and went unpadded until the next
+        // resume (seen 2026-11-24: two "left as-is (count=7)" checks while
+        // the last icon was still 3.7 s away from binding). Stock runs its
+        // own trailing-page trim right here, so this is where the count is
+        // final.
+        try {
+            final Class<?> launcherClsFinish = XposedHelpers.findClass(
+                    "com.miui.home.launcher.Launcher", lpp.classLoader);
+            XposedHelpers.findAndHookMethod(launcherClsFinish, "finishLoading",
+                    boolean.class, boolean.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(XC_MethodHook.MethodHookParam param) {
+                            postEvenPagesCheck(param.thisObject);
+                        }
+                    });
+            log("hook 11c ok: even-page check on finishLoading");
+        } catch (Throwable t) {
+            log("hook 11c FAILED: " + t);
+        }
+
         // 13. Launcher.checkDualScreen re-asserts stock page width
         // (screen/2) on every config change, overriding hook 6/7 — re-apply
         // the three-page width after it runs.
         //
-        // 15/16 (same block below): veto hooks on Workspace.deleteScreen /
-        // removeScreen — stock prunes trailing empty pages on edit-mode
-        // entry/exit, which discarded our parity page.
+        // 15/16 (own block below): veto hooks on Workspace.deleteScreen /
+        // removeScreen — stock prunes trailing empty pages after every
+        // drop animation, on edit-mode entry/exit and on load, which
+        // discarded our parity page.
         try {
             final Class<?> launcherCls2 = XposedHelpers.findClass(
                     "com.miui.home.launcher.Launcher", lpp.classLoader);
@@ -936,70 +981,32 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         // 15/16. even-page veto: block removal of the trailing EMPTY page
-        // when removing it would break the snap-unit parity — edit mode
-        // only (stock's edit-cycle pruning); normal-mode removals are part
-        // of stock's own flows (drag-to-edge page creation) and must pass.
-        // Non-empty pages (user content) always remain removable.
+        // when removing it would break the snap-unit parity. Non-empty
+        // pages (user content) always remain removable.
+        //
+        // Stock deletes a screen through one path only: CellLayout's
+        // delete-self runnable -> deleteScreen(long) (DB delete, later
+        // bindScreenRemoved -> removeScreen(int)), posted in bulk by
+        // checkAllScreensToSelfDelete() after every drop animation, on
+        // edit-mode entry/exit and on workspace load. Stock keeps a
+        // trailing blank only while items are checked in multi-select
+        // (needShowLastEmptyScreen), so our parity page is always
+        // prunable to it — including right after a long-press raised the
+        // shortcut menu, which never enters an editing state the old
+        // edit-only gate could see (PageParity has the decompile detail).
         try {
             final Class<?> workspaceCls2 = XposedHelpers.findClass(
                     "com.miui.home.launcher.Workspace", lpp.classLoader);
-            XC_MethodHook vetoHook = new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
-                    try {
-                        Context app = appContext();
-                        if (app == null || !onInnerScreen(app) || !cfgPadOpt) {
-                            return;
-                        }
-                        loadCfg(app);
-                        // parity lock is a portrait two-up feature; landscape
-                        // three-page mode pages freely (no veto, no parity)
-                        if (isLandscape(modeCtx(app)) && cfgLandPages == 3) {
-                            return;
-                        }
-                        Object ws = param.thisObject;
-                        // veto only stock's edit-cycle pruning. Removals in
-                        // normal mode belong to stock's own flows — the
-                        // drag-to-edge page creation re-manages the trailing
-                        // page, and blocking it kills the gesture outright
-                        if (!(Boolean) XposedHelpers.callMethod(ws, "isInNormalEditingMode")) {
-                            return;
-                        }
-                        int count = (Integer) XposedHelpers.callMethod(ws, "getScreenCount");
-                        if (count <= 1) {
-                            return;
-                        }
-                        int modulo = isLandscape(modeCtx(app)) ? cfgLandPages : 2;
-                        int idx;
-                        if (param.args[0] instanceof Long) {
-                            idx = (Integer) XposedHelpers.callMethod(
-                                    ws, "getScreenIndexById", (Long) param.args[0]);
-                        } else {
-                            idx = (Integer) param.args[0];
-                        }
-                        if (idx != count - 1 || (count - 1) % modulo == 0) {
-                            return; // not the trailing page, or removal keeps parity
-                        }
-                        Object cellScreen = XposedHelpers.callMethod(ws, "getCellScreen", idx);
-                        Object layout = cellScreen == null ? null
-                                : XposedHelpers.callMethod(cellScreen, "getCellLayout");
-                        int children = layout == null ? -1
-                                : (Integer) XposedHelpers.callMethod(layout, "getChildCount");
-                        if (children != 0) {
-                            return; // non-empty: user content, allow removal
-                        }
-                        log("even-pages: vetoed removal of trailing parity page (count="
-                                + count + ")");
-                        param.setResult(null);
-                    } catch (Throwable t) {
-                        log("even-page veto failed: " + t);
-                    }
-                }
-            };
+            // deleteScreen: reached before anything is mutated — the only
+            // place a veto is side-effect free, so it carries the full
+            // gate (also while stock is not dragging).
             XposedHelpers.findAndHookMethod(workspaceCls2, "deleteScreen",
-                    long.class, vetoHook);
+                    long.class, parityVetoHook(true));
+            // removeScreen: by now the DB row is gone (bindScreenRemoved
+            // has already dropped the id) — a veto here strands an orphan
+            // page view, so it keeps the legacy edit-mode-only gate.
             XposedHelpers.findAndHookMethod(workspaceCls2, "removeScreen",
-                    int.class, vetoHook);
+                    int.class, parityVetoHook(false));
             log("hook 15/16 ok: even-page removal veto");
         } catch (Throwable t) {
             log("hook 15/16 FAILED: " + t);
@@ -2357,6 +2364,89 @@ public class MainHook implements IXposedHookLoadPackage {
         log(point + ": " + pkg + " -> follow system");
     }
 
+    /** Hook 15/16 body: veto a stock removal of the trailing parity page.
+     *  Reflection facts are gathered here and handed to the pure gates in
+     *  {@link PageParity}; nothing is touched unless both gates agree. */
+    private static XC_MethodHook parityVetoHook(final boolean cleanChokePoint) {
+        return new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) {
+                try {
+                    Object ws = param.thisObject;
+                    Context app = appContext();
+                    if (app == null || !onInnerScreen(app)) {
+                        return;
+                    }
+                    loadCfg(app);
+                    // policy gate: 边距优化 or the explicit pairs opt-in;
+                    // both off means stock paging, nothing protected
+                    if (!PageParity.policyActive(cfgPadOpt, cfgAlwaysPad,
+                            isLandscape(modeCtx(app)), cfgLandPages)) {
+                        return;
+                    }
+                    boolean editing = (Boolean) XposedHelpers.callMethod(
+                            ws, "isInNormalEditingMode");
+                    boolean dragging = stockDragging(ws);
+                    if (!PageParity.vetoAllowed(cleanChokePoint, editing, dragging)) {
+                        return;
+                    }
+                    int count = (Integer) XposedHelpers.callMethod(ws, "getScreenCount");
+                    int idx;
+                    if (param.args[0] instanceof Long) {
+                        idx = (Integer) XposedHelpers.callMethod(
+                                ws, "getScreenIndexById", (Long) param.args[0]);
+                    } else {
+                        idx = (Integer) param.args[0];
+                    }
+                    if (count <= 1 || idx != count - 1) {
+                        return; // not the trailing page
+                    }
+                    Object cellScreen = XposedHelpers.callMethod(ws, "getCellScreen", idx);
+                    Object layout = cellScreen == null ? null
+                            : XposedHelpers.callMethod(cellScreen, "getCellLayout");
+                    int children = layout == null ? -1
+                            : (Integer) XposedHelpers.callMethod(layout, "getChildCount");
+                    if (children != 0) {
+                        return; // non-empty: user content, allow removal
+                    }
+                    // the parity page is a blank paired with content — the
+                    // shape ensureEvenPages appends; two blanks in a row are
+                    // leftovers and stay stock's to clean
+                    boolean predecessorEmpty = isScreenEmpty(ws, idx - 1);
+                    int modulo = isLandscape(modeCtx(app)) ? cfgLandPages : 2;
+                    if (!PageParity.breaksParity(count, idx, true, predecessorEmpty, modulo)) {
+                        return; // removal keeps parity, or not a parity page
+                    }
+                    log("even-pages: vetoed removal of trailing parity page (count="
+                            + count + ", " + (dragging ? "edit-mode" : "stock-idle") + ")");
+                    param.setResult(null);
+                } catch (Throwable t) {
+                    log("even-page veto failed: " + t);
+                }
+            }
+        };
+    }
+
+    /** Is a stock drag in progress? DragController.mDragging: set at the
+     *  end of startDrag, cleared at the top of endDrag — before the drop
+     *  animation and every post-drop screen trim run, so "not dragging"
+     *  covers each of stock's clean-up moments and none of its drag-to-edge
+     *  page flow. Field access only: resolving Launcher's methods drags in
+     *  optional plugin classes on HyperOS (see renotifyRotationRequest).
+     *  Anything unreadable reads as "dragging" — a state we cannot judge
+     *  never adds a veto. */
+    private static boolean stockDragging(Object workspace) {
+        try {
+            Object launcher = XposedHelpers.getObjectField(workspace, "mLauncher");
+            Object controller = launcher == null ? null
+                    : XposedHelpers.getObjectField(launcher, "mDragController");
+            return controller == null
+                    || XposedHelpers.getBooleanField(controller, "mDragging");
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
     /** Post a deferred parity check for the launcher's workspace. Posted so
      *  it never runs mid-way through a stock screen operation or a config
      *  change dispatch (see §12); no-op when the workspace does not exist. */
@@ -2382,9 +2472,12 @@ public class MainHook implements IXposedHookLoadPackage {
      * EMPTY page is never touched — it may be stock's drag-to-edge
      * anticipation page (icon still in flight) or a page the user just added
      * in edit mode; deleting it broke both flows (see §12). A lone trailing
-     * blank terminates the last pair harmlessly. Enforced for portrait
-     * two-up only; landscape three-page mode pages freely (no parity lock),
-     * per design decision.
+     * blank terminates the last pair harmlessly. Runs when 边距优化 is on
+     * (reverse alignment needs complete pairs; stock margins do not) or
+     * when the pairs opt-in (cetushome_always_pad) asks for it without
+     * margins — both off means stock paging — and never in landscape
+     * three-page mode, which pages freely (design decision). The veto of
+     * hooks 15/16 goes through the same gate (PageParity.policyActive).
      *
      * Re-entrancy guard: insertNewScreen can synchronously fire stock's
      * reorderScreens, whose after-hook lands back here while the screen
@@ -2402,15 +2495,17 @@ public class MainHook implements IXposedHookLoadPackage {
                 return;
             }
             loadCfg(app);
-            if (isLandscape(modeCtx(app)) && cfgLandPages == 3) {
-                return; // three-page mode: free paging, no parity lock
+            // policy gate: 边距优化 or the explicit pairs opt-in; both off
+            // means stock paging, nothing padded
+            if (!PageParity.policyActive(cfgPadOpt, cfgAlwaysPad,
+                    isLandscape(modeCtx(app)), cfgLandPages)) {
+                return;
             }
             if ((boolean) XposedHelpers.callMethod(workspace, "isInNormalEditingMode")) {
                 return;
             }
             int count = (int) XposedHelpers.callMethod(workspace, "getScreenCount");
-            if (count < 1 || count % 2 == 0) {
-                return;
+            if (count < 1 || count % 2 == 0) {                return;
             }
             if (isScreenEmpty(workspace, count - 1)) {
                 log("even-pages: trailing empty page left as-is (count=" + count + ")");

@@ -51,12 +51,30 @@ public final class BackupCodecTest {
         check("round trip no unknown dropped", 0, p.skippedUnknown);
         check("round trip no invalid dropped", 0, p.skippedInvalid);
 
-        // keys in LEGACY_KEYS order, one per line, trailing newline
+        // keys in CONFIG_KEYS order, one per line, trailing newline
         StringBuilder want = new StringBuilder(HEADER);
         for (String kv : KV8) {
             want.append(kv).append('\n');
         }
-        check("encode emits LEGACY_KEYS order", want.toString(), encodeAll8());
+        check("encode emits CONFIG_KEYS order", want.toString(), encodeAll8());
+
+        // the post-1.9.0 pairs opt-in round-trips like any other key, in
+        // its CONFIG_KEYS slot (right after pad-opt), not at the tail
+        Map<String, String> withOptIn = all8();
+        withOptIn.put(PrefsKeys.KEY_ALWAYS_PAD, "1");
+        String withOptInText = BackupCodec.encode(
+                PrefsKeys.MODULE_PKG, "1.9.3", 1L, withOptIn);
+        check("pairs opt-in is written after pad-opt",
+                true, withOptInText.indexOf(PrefsKeys.KEY_ALWAYS_PAD + "=1")
+                        > withOptInText.indexOf(PrefsKeys.KEY_PAD_OPT + "=0"));
+        check("pairs opt-in is written before lock-rot",
+                true, withOptInText.indexOf(PrefsKeys.KEY_ALWAYS_PAD + "=1")
+                        < withOptInText.indexOf(PrefsKeys.KEY_LOCK_ROT + "=1"));
+        BackupCodec.Parsed optIn = BackupCodec.parse(withOptInText);
+        check("pairs opt-in accepted on import",
+                "1", optIn.values.get(PrefsKeys.KEY_ALWAYS_PAD));
+        check("pairs opt-in import drops nothing",
+                0, optIn.skippedUnknown + optIn.skippedInvalid);
 
         // missing keys are skipped, not written as defaults
         Map<String, String> partial = new LinkedHashMap<String, String>();

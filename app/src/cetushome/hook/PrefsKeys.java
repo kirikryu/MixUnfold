@@ -21,6 +21,7 @@ final class PrefsKeys {
     static final String KEY_PAD_LAND = "cetus_home_padding_side_land";
     static final String KEY_LAND_PAGES = "cetus_home_land_pages";
     static final String KEY_PAD_OPT = "cetus_home_pad_opt";
+    static final String KEY_ALWAYS_PAD = "cetus_home_always_pad";
     static final String KEY_LOCK_ROT = "cetus_home_lockscreen_rot";
     static final String KEY_FREE_ROT = "cetus_free_rot";
     static final String KEY_ROT_EXCLUDE = "cetus_free_rot_exclude";
@@ -29,6 +30,7 @@ final class PrefsKeys {
     static final int DEF_PAD = 120;
     static final int DEF_LAND_PAGES = 3;
     static final int DEF_PAD_OPT = 0;
+    static final int DEF_ALWAYS_PAD = 0;
     static final int DEF_LOCK_ROT = 1;
     static final int DEF_FREE_ROT = 1;
     static final String DEF_ROT_EXCLUDE = "";
@@ -46,8 +48,33 @@ final class PrefsKeys {
             KEY_ROT_EXCLUDE,
     };
 
+    /** Every user-visible config key, in backup order: the legacy eight plus
+     *  keys introduced later (they have no Settings.System ancestor, so they
+     *  stay out of LEGACY_KEYS and the migration). */
+    static final String[] CONFIG_KEYS = {
+            KEY_COLUMNS,
+            KEY_PAD_PORT,
+            KEY_PAD_LAND,
+            KEY_LAND_PAGES,
+            KEY_PAD_OPT,
+            KEY_ALWAYS_PAD,
+            KEY_LOCK_ROT,
+            KEY_FREE_ROT,
+            KEY_ROT_EXCLUDE,
+    };
+
     static boolean isLegacyKey(String key) {
         for (String k : LEGACY_KEYS) {
+            if (k.equals(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Backup whitelist: legacy keys plus post-1.9.0 additions. */
+    static boolean isConfigKey(String key) {
+        for (String k : CONFIG_KEYS) {
             if (k.equals(key)) {
                 return true;
             }
@@ -69,6 +96,9 @@ final class PrefsKeys {
         }
         if (KEY_PAD_OPT.equals(key)) {
             return DEF_PAD_OPT;
+        }
+        if (KEY_ALWAYS_PAD.equals(key)) {
+            return DEF_ALWAYS_PAD;
         }
         if (KEY_LOCK_ROT.equals(key)) {
             return DEF_LOCK_ROT;
@@ -92,8 +122,8 @@ final class PrefsKeys {
         if (KEY_LAND_PAGES.equals(key)) {
             return v == 2 || v == 3;
         }
-        if (KEY_PAD_OPT.equals(key) || KEY_LOCK_ROT.equals(key)
-                || KEY_FREE_ROT.equals(key)) {
+        if (KEY_PAD_OPT.equals(key) || KEY_ALWAYS_PAD.equals(key)
+                || KEY_LOCK_ROT.equals(key) || KEY_FREE_ROT.equals(key)) {
             return v == 0 || v == 1;
         }
         if (KEY_PAD_PORT.equals(key) || KEY_PAD_LAND.equals(key)) {

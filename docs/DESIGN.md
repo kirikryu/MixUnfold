@@ -53,11 +53,12 @@
 | 8 | `DeviceConfig.calcGridSize` | after | 三页模式下工作宽跟随 `屏宽/3`，并触发 `calculateCellSize` 重算 |
 | 9 | `DeviceConfig.getCellCountX` | before→实时列数 | 原生列数进程启动后缓存且旋转不重读；配置值进程内缓存一次，热路径零额外查询 |
 | 10 | `Application.onCreate` | after | 注册进程内重启广播接收器 |
-| 11/12 | `Launcher.onResume` / `Launcher.onConfigurationChanged`（13b 复用路径）/ `Workspace.reorderScreens`（后两者 post 延迟执行） | after | 偶数页策略：页数为奇且末页**有内容**时补 1 页空白；末尾空白页**一律不动**（可能是原厂拖拽预备页或用户刚建的页，见第 12 节）；编辑模式跳过；重入锁防双补；onResume 顺带触发 13b 的方向重发（去重，无开销） |
+| 11/12 | `Launcher.onResume` / `Launcher.onConfigurationChanged`（13b 复用路径）/ `Workspace.reorderScreens`（后两者 post 延迟执行） | after | 偶数页策略：页数为奇且末页**有内容**时补 1 页空白；末尾空白页**一律不动**（可能是原厂拖拽预备页或用户刚建的页，见第 12 节）；编辑模式跳过；重入锁防双补；onResume 顺带触发 13b 的方向重发（去重，无开销）。**策略门**（`PageParity.policyActive`）：「外侧边距优化」开启，或用户显式开启「边距优化关闭时也补足双数页」（配置键 `cetushome_always_pad`，默认关）；两者皆关即原厂分页、不补页。横屏三页模式在任何组合下都豁免 |
+| 11c | `Launcher.finishLoading` | after | 桌面装载完成后 post 一次偶数页检查：其余触发点都发生在装载期间（`CellLayout` 还是空的），重启桌面后奇数页会被误判为"末尾空白页"而漏补、要等下次 resume；原厂自己的末页清理也在这里，页数此刻才是最终值 |
 | 13 | `Launcher.checkDualScreen` | after | 三页模式下把每页页宽重新设为 `屏宽/3`：原生在每次配置变化后重断言页宽 `屏宽/2`，会覆盖钩子 6/7 的结果 |
 | 13b | `Launcher.onConfigurationChanged` | after | 折叠/展开切换后重跑方向请求决策（复刻 `RotationHelper.notifyChange` 并按 `mLastActivityFlags` 去重）；顺带 post 偶数页检查——Launcher 自消化 configChanges（旋转不重建、不触发 onResume），不挂这里的话旋转后奇偶约束的切换要等下次 resume 才生效 |
 | 14 | `FoldScreenIndexCalculator.obtainValidCurrentScreenIndex` | before | 三页模式下吸附目标改为 3 页组边界（原生硬编码 `% 2` 成对校准并强制末页回退一位）；非三页模式不动 |
-| 15/16 | `Workspace.deleteScreen(long)` / `removeScreen(int)` | before | 偶数页保护：**仅编辑模式**中，移除末页会破坏翻页单位奇偶、且该页为空白页时否决移除（非空页始终放行；普通模式的移除属于原厂自身流程——拖边建页会重建末尾页，拦截会弄死手势）；仅展开态且「外侧边距优化」开启时生效，横屏三页模式不启用 |
+| 15/16 | `Workspace.deleteScreen(long)` / `removeScreen(int)` | before | 偶数页保护：移除末页会破坏翻页单位奇偶、该页为空白页且前一页有内容（即补页会补出的形状）时否决移除（非空页始终放行，两页连续空白照旧由原厂清理）。`deleteScreen` 是原厂**唯一**删页入口、此刻尚未改动任何状态：**原厂未在拖拽中即否决**，外加编辑模式中的原否决（拖拽中亦然）；`removeScreen` 发生在数据库行已删之后（否决会留下孤儿页视图），**仅保留**编辑模式否决。与补页共用同一策略门 `PageParity.policyActive`（边距优化 或 补页选项；横屏三页模式豁免），开关全关时不拦截。判定纯逻辑见 `PageParity`，根因见第 12 节 |
 | 17 | `ItemInfo.load(Context, Cursor)` | after | 运行时小部件收缩：桌面容器（`container==-100`）条目解析后 `spanX→min(spanX,列数)`、`cellX→min(cellX,列数−spanX)`（仅 X 侧——模块从不改行数，Y 不可能越界）。**不写回数据库**，列数调回原值重启桌面即恢复原始尺寸。根因与数学见第 14 节 |
 | 18 | `MIUIWidgetCompat.createItemInfo(Launcher, Bundle)` | after | MIUI 小部件添加路径 span 归一：选择器 bundle 的 span 按**原厂网格**标注，原生仅在 `getCellCountX()==getCellCountXMin()` 时（"最窄网格，选择器尺寸可信"）用 bundle 原值覆盖——模块把 Min 钉到设置列数使该门恒真，4 列标注的 spanX=4 进入 3 列网格被 `Workspace.acceptDrop`（:1320）直接拒绝（"添加不了"）。钳制返回对象的 `spanX`，覆盖选择器拖出 / 预备 / 替换全部三个调用方（§14 根因三） |
 | 19 | `MIUIWidgetReplaceHandler.canReplace(Bundle, MIUIWidgetBasicInfo)` | before | 更换小部件路径的同一标注错配、且早一重门：`canReplace`（:15-20）要求**旧部件运行时 spanX ≥ 新部件 bundle 标注 spanX**——收窄网格下旧部件显示宽为钳制后的 3、bundle 仍标 4，`3>=4` 恒假 → `replaceWidget abort`（:72-74，在移除旧部件之前返回）→ 更换无声无息不生效（4 列 4≥4 恒过；列数 <4 均触发）。仅当标注 spanX 超出当前列数时按 `WidgetSpan.fitSpanX` 折算后重判，Y 比较与不超界情形完全走原厂语义（§14 根因四） |
@@ -512,19 +513,145 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
    编辑门限的否决把该流程拦死（拖边建页失效）。原设计要防的"编辑
    进出时原厂清页"仍被覆盖；若退出编辑的清页发生在编辑标志清除
    之后，空白页会被原厂清掉，由下一个触发点按第 4 条补回（可接受
-   的抖动）；
+   的抖动。1.9.3 起该残留由第 7 条在 `deleteScreen` 入口拦下，见
+   下文根因三）；
 6. **方向判定统一走 `modeCtx()`**（实时 Launcher Activity 优先、app
    上下文兜底）：钩子 4/5/6/7/8/11/12/14/15/16 共 9 处，消除根因二。
    `onInnerScreen` 内部与钩子 13（`param.thisObject` 即实时 Launcher）
    本就正确，不动。
 
+**根因三（长按呼出快捷菜单后配对页消失，1.9.3；待办 #3 第三项）**
+
+**症状**（机主实测）：最后一页长按图标呼出快捷菜单列表时，偶数页
+保护补出的末尾空白页消失。
+
+**原厂删页通路**（`RELEASE-4.39.12.6887`，jadx 反编译 + 设备 APK
+dexdump 复核，APK sha256 `d6271fb2…be39851e`）：
+
+- 全桌面只有一条：`CellLayout` 的自删 runnable → `CellLayout.deleteSelf()`
+  → `Workspace.deleteScreen(long)`（该方法的唯一调用者），经
+  `ScreenRemoveTask` 删库后回调 `bindScreenRemoved` → `removeScreen(int)`；
+- 该 runnable 由 `CellLayout.checkToDeleteSelf()` 投递（本页移除条目、
+  待定条目移除、删除末页三个单页入口也走它）；批量清理走
+  `Workspace.checkAllScreensToSelfDelete()`，调用点 5 处：
+  `Launcher.bindScreenTrim`（每次拖拽落回动画结束后，经
+  `Workspace.onDropAnimationFinish` → `ScreenTrimTask`）、
+  `Launcher.setEditingState` 的 case 7（退出编辑）与 case 8（进入编辑）、
+  `Launcher.finishLoading`（装载完成）、图标整理结束；
+- 能否删由 `CellLayout.canBeDeleted()` 决定，末页额外看
+  `Workspace.needShowLastEmptyScreen()`——仅多选勾选了不在末个非空页
+  的图标时为真。即原厂只在多选编辑期间保留末尾空页，其余时候模块补
+  的配对页对它始终是"可清理"的。
+
+第 5 条把否决门收窄到 `Workspace.isInNormalEditingMode()`，而它等价于
+`mEditingMode ∉ {7, 9}`（初值 7）：普通态、快捷菜单态
+（`mEditingState = 17`，`Launcher.onDragStart` 进入）与快速编辑过渡态
+都不满足。长按 → 松手落回（`onDropAnimationFinish`）→ 关闭菜单回到
+普通态（`setEditingState(7)`）的两次清理因此都不被拦截。
+
+**真机定性**（2026-11-24，cetus / HyperOS 1.0.8.0 / 桌面
+`RELEASE-4.39.12.6887-01231503`；机主配置 `columns=3 landPages=2
+padOpt=true`，横屏双页，8 页且末页为配对空白页；1.9.2 复现）：长按
+索引 6（末个内容页）的图标 → `edit state changed from 7 to 17` →
+松手 `action_drag_off`，147 ms 后原厂清掉配对页（`Screens before
+reorder` 少一项），13 ms 后模块经 `reorderScreens` 回调补回。页数
+虽然约 40 ms 内复原，但原厂删页瞬间重算了滚动范围并把桌面往回吸附
+了一页——视图停在索引 5 | 6（应为 6 | 7），配对页被挤出视野，补回的
+新页也不会把视图拉回；关闭菜单（`17 → 7`）再清一次、再补一次。机主
+看到的"消失"即此视图错位。
+
+**修正（第 7 条，钩子 15）**：`DragController.mDragging` 在 `endDrag()`
+开头即清零，早于落回动画与其后的全部清理；而原厂拖边建页的删/建都
+发生在拖拽中。故 `deleteScreen` 入口改为**原厂未在拖拽中即否决**；
+"编辑模式"的原否决原样保留；拖拽中一律放行，第 5 条的教训不变。受
+保护的仅限"**前一页有内容**的末尾空白页"——正是补页会补出的形状；
+两页连续空白不是配对页而是遗留（旧版双补、用户清空的页），照旧由
+原厂清理。`removeScreen` 入口不扩展——此时数据库行已删，否决只会留下
+孤儿页视图。拖拽状态经**字段**读取（`Workspace.mLauncher →
+Launcher.mDragController → mDragging`），不解析 Launcher 的方法签名
+（原因见 `renotifyRotationRequest` 注释）；读不到时按"拖拽中"处理，
+宁可不放行否决。判定抽为纯逻辑 `PageParity`（时机门 + 几何门），JVM
+回归 `PageParityTest`。
+
+**策略开关语义（1.9.3 对齐设计）**：补页的存在理由是边距优化的反向
+对齐需要成对页（偶数页左边距 B、奇数页 0，成对才咬合；原厂边距按页
+对称，单数页不穿帮）。因此**补页与保护共用同一策略门**
+`PageParity.policyActive`：「外侧边距优化」开启 → 生效；关闭 → 原厂
+分页、不补页也不拦截。这修掉了一处 1.6.2 起就存在的偏差——此前补页
+不看该开关（关闭边距优化后仍会补页，真机实测 1.9.2 复现：`padOpt=false`
+下 `even-pages: appended 1`），而保护看。另为"不优化边距但就想要成对
+页"的用户新增独立选项「**边距优化关闭时也补足双数页**」（`cetushome_always_pad`，
+默认关），开启后策略在原厂边距下同样运行、配对页同样受保护。
+
+**横屏三页模式在一切组合下豁免**（含新选项打开）：该模式吸附单位是
+3，偶数页奇偶锁没有意义；补到偶数反而会在三页分组外留下孤组，与模块
+自己的三页吸附钩子（第 14 条）冲突。这是 1.8.2 的既定设计，未改。
+
+**装载期漏补（同批修复，钩子 11c）**：补页的所有触发点都发生在桌面
+装载期间——此时 `CellLayout` 还是空的，末页被判"末尾空白页"而跳过
+（真机实测：重启后 16.296/18.229 两次 `trailing empty page left as-is
+(count=7)`，最后一个图标 19.923 才装完，此后无人检查，页数停在 7）。
+以前数据库里长期存着那页空白掩盖了它；「关闭 → 开启补页 → 重启」会
+稳定撞上。修法：挂 `Launcher.finishLoading`（原厂自己的末页清理也在
+这里）post 一次检查，页数此刻才是最终值。
+
+**真机验证**（同机同配置，1.9.3 debug 构建，2026-11-24）：
+
+- 桌面重启：`Screens loaded [1, 2, 3, 4, 9, 10, 11, 12]` 后原厂的
+  启动清理被否决（`vetoed removal of trailing parity page (count=8,
+  stock-idle)`），页列表不再经历"删 12 → 补 12"；
+- 长按呼出快捷菜单（`7 → 17`）并松手：落回后 140 ms 记一次否决，
+  视图停在索引 6 | 7 不动；关闭菜单（`17 → 7`）再记一次否决；竖屏
+  双页下（临时锁定竖屏）结果相同；
+- 图标拖拽共 9 次（末页内挪动、拖到配对页、配对页拖回、拖边建页后
+  还原）：状态流转 `7 → 17 → 9 → 7` 完整，拖拽中没有任何否决，落手
+  后原厂发起的清理均被否决；
+- 编辑模式进出（最后一组）：进入（`7 → 8`）与退出（`8 → 7`）各记
+  一次否决，页列表不变；
+- 拖边新建页：末页有内容时把图标拖到右缘，原厂在 `17 → 9` 后 49 ms
+  即建好新页（`Screens before reorder` 多一项），模块只记"末尾空白页
+  保持不动"；图标放到新页后总页数 9，按 HOME 才补成 10（FAQ 既有
+  行为）。随后把图标拖回时，10 页状态下的配对空白页被否决保护
+  （`count=10`），中间的非末尾空白页照常被原厂删除，页数变 9 后末尾
+  空白页不再受保护、照常删除——与 `PageParity` 的几何门逐条一致。
+
+**开关语义真机验证**（同上设备，2026-11-24 晚）：
+
+- 1.9.2 关闭「外侧边距优化」后重启：`padOpt=false` 仍出现
+  `even-pages: appended 1, count 7 -> 8`——坐实旧代码补页不看开关；
+- 1.9.3「边距优化关、补页选项关」重启：原厂把末页空白清掉后模块不再
+  补页，停在 7 页，长按快捷菜单全程模块零日志（纯原厂分页）；
+- 1.9.3「边距优化开」重启：模块在装载期两次记
+  `trailing empty page left as-is (count=7)`（末页图标尚未装完），
+  页数停在 7 直到下一次 resume 才补——由此定位钩子 11c，见上文。
+
+**待复测（钩子 11c 与新补页选项之后）→ 已全部实测通过（2026-11-24 晚）**：
+
+- 「边距优化关 + 补页选项开」重启：`padOpt=false alwaysPad=true`，装载
+  完成后 `appended 1, count 7 -> 8`，随后原厂的末页清理被否决
+  （`count=8`）——不优化边距也补页且受保护；长按快捷菜单的两次清理
+  同样被否决；
+- 「边距优化关 + 补页选项关」重启：原厂清掉末页空白、模块零日志，
+  停在 7 页（原厂分页）；
+- 「边距优化开」重启（7 页起步）：装载期先记一次"末尾空白页保持不
+  动"，`Launcher.finishLoading` 后立即 `appended 1, count 7 -> 8` 并
+  否决随后的清理——11c 修复前这里要等下一次 resume 才补。
+
+**已知残留（非本修复引入）**：在最后一组进出编辑模式后，视图落在
+索引 5 | 6 而非 6 | 7——退出编辑时原厂自行滚动到
+`setCurrentScreenInner:5`，期间没有任何删页；1.9.2 上同样落 5 | 6
+（A/B 实测，其后还有一轮删—补）。中间页组进出编辑视图不动；落在
+5 | 6 后左滑一次即回到 6 | 7（实测）。推测是原厂退出编辑时以末个有
+内容的页为落点基准，未在代码中逐行核实。要不要让配对页在退出编辑后
+回到视野，属后续产品决策。
+
 **残留既定行为**：竖屏两页模式下内容页为奇数、且末页有内容时仍合法
 补 1 页配对（钩子 11/12 的设计目标）。触发点覆盖 resume / 配置变化
-（旋转、折叠切换）/ reorder 三类；奇数页若在免补模式（横屏三页）下
-产生，转入两页模式的旋转当拍即触发补页检查（13b 复用路径）。该配对
-空白页在横屏三页下短暂可见，进出一次编辑模式即由原厂清理（修正后
-15/16 在三页横屏不再误拦）。折叠态外屏任何情况都不增删页
-（`onInnerScreen` 门保障）。
+（旋转、折叠切换）/ reorder / 装载完成（11c）四类；奇数页若在免补模式
+（横屏三页）下产生，转入两页模式的旋转当拍即触发补页检查（13b 复用
+路径）。该配对空白页在横屏三页下短暂可见，进出一次编辑模式即由原厂
+清理（修正后 15/16 在三页横屏不再误拦）。折叠态外屏任何情况都不增删
+页（`onInnerScreen` 门保障）。
 
 ## 13. 排除清单注入加固与安全扫描 Seal 语义
 
@@ -748,7 +875,11 @@ shell；锚点随代码漂移，1.8.4 复扫落在 E1 Javadoc 注释内）。1.8
 `cetus_home_land_pages`(3)、`cetus_home_pad_opt`(0)、
 `cetus_home_lockscreen_rot`(1)、`cetus_free_rot`(1)、
 `cetus_free_rot_exclude`("")。`PrefsKeys.LEGACY_KEYS` 是迁移与回落的
-唯一键表，`PrefsMigrationTest` 逐字锁定。
+唯一键表，`PrefsMigrationTest` 逐字锁定。1.9.3 新增
+`cetus_home_always_pad`(0，「边距优化关闭时也补足双数页」)：它没有
+`Settings.System` 前身，**不进** `LEGACY_KEYS`/迁移；用户可见键的完整
+清单是 `CONFIG_KEYS`（备份顺序，含新旧全部键），`isConfigKey` 是备份
+解析的白名单。
 
 **迁移判定**：`SharedPreferences.contains()` 是唯一判据——已存的 0/false
 是有效值，不与默认值比较。app 每次启动补齐缺失键并写
@@ -854,7 +985,7 @@ schema=1                      格式门：>1 整文件拒绝（提示先升级�
 pkg=cetushome.rotationunlock  来源门：必须与本模块包名一致
 version=1.9.1                 信息性
 exportedAt=<millis>           信息性
-<key>=<value>                 8 个配置键，LEGACY_KEYS 顺序
+<key>=<value>                 用户可见配置键，CONFIG_KEYS 顺序
 ```
 
 选行式而非 JSON 的原因：排除清单值被 `ExcludeCodec` 保证只含

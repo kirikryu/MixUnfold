@@ -14,7 +14,7 @@ import java.util.Map;
  *      pkg=cetushome.rotationunlock origin gate: must match MODULE_PKG
  *      version=1.9.1                informational
  *      exportedAt=1699000000000     informational (millis)
- *      &lt;key&gt;=&lt;value&gt;              the eight config keys, LEGACY_KEYS order
+ *      &lt;key&gt;=&lt;value&gt;              user-visible config keys, CONFIG_KEYS order
  *
  *  Security model: the backup file is untrusted input (user-chosen via SAF,
  *  may be hand-edited or foreign). Structural damage (wrong magic, missing
@@ -66,7 +66,7 @@ final class BackupCodec {
         sb.append("pkg=").append(pkg == null ? "" : pkg).append('\n');
         sb.append("version=").append(version == null ? "" : version).append('\n');
         sb.append("exportedAt=").append(exportedAt).append('\n');
-        for (String key : PrefsKeys.LEGACY_KEYS) {
+        for (String key : PrefsKeys.CONFIG_KEYS) {
             String v = values.get(key);
             if (v != null) {
                 sb.append(key).append('=').append(v).append('\n');
@@ -157,7 +157,7 @@ final class BackupCodec {
                 }
             } else if ("version".equals(key) || "exportedAt".equals(key)) {
                 // informational: accepted verbatim, never applied
-            } else if (PrefsKeys.isLegacyKey(key)) {
+            } else if (PrefsKeys.isConfigKey(key)) {
                 if (PrefsKeys.KEY_ROT_EXCLUDE.equals(key)) {
                     // raw passthrough; SettingsWriter re-filters via
                     // ExcludeCodec on write

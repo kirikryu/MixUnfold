@@ -42,11 +42,13 @@ public class MainActivity extends Activity {
     private static final String KEY_PAD_LAND = MainHook.KEY_PAD_LAND;
     private static final String KEY_LAND_PAGES = MainHook.KEY_LAND_PAGES;
     private static final String KEY_PAD_OPT = MainHook.KEY_PAD_OPT;
+    private static final String KEY_ALWAYS_PAD = MainHook.KEY_ALWAYS_PAD;
     private static final String KEY_LOCK_ROT = MainHook.KEY_LOCK_ROT;
     private static final String KEY_FREE_ROT = MainHook.KEY_FREE_ROT;
 
     private int cols = 3, landPages = 3;
     private boolean padOpt = false;
+    private boolean alwaysPad = false;
     private boolean lockRot = true;
     private boolean freeRot = true;
 
@@ -55,7 +57,7 @@ public class MainActivity extends Activity {
     private TextView colsVal, status;
     private Button excludeEntry;
     // promoted from buildPage locals: an imported backup repaints these
-    private Switch rotSwitch, optSwitch, lockSwitch;
+    private Switch rotSwitch, optSwitch, alwaysPadSwitch, lockSwitch;
     private Spinner pagesSpinner;
     private SeekBar colsBar;
     /** Guard: refreshUiFromPrefs() repaints widgets without scheduleWrite(). */
@@ -84,6 +86,7 @@ public class MainActivity extends Activity {
         cols = read(KEY_COLUMNS, 3);
         landPages = read(KEY_LAND_PAGES, 3);
         padOpt = read(KEY_PAD_OPT, 0) == 1;
+        alwaysPad = read(KEY_ALWAYS_PAD, 0) == 1;
         lockRot = read(KEY_LOCK_ROT, 1) == 1;
         freeRot = read(KEY_FREE_ROT, 1) == 1;
 
@@ -261,6 +264,33 @@ public class MainActivity extends Activity {
                 + "关闭：采用小米原版边距方案（原生边距与页缝保留）。");
         h.addView(optDesc);
 
+        // Pairs without margins: off by default, meaningful only while the
+        // margin switch above is off (reverse alignment already forces pairs).
+        alwaysPadSwitch = new Switch(this);
+        alwaysPadSwitch.setText("边距优化关闭时也补足双数页");
+        alwaysPadSwitch.setTextSize(15);
+        alwaysPadSwitch.setTextColor(cPrimary);
+        alwaysPadSwitch.setChecked(alwaysPad);
+        alwaysPadSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
+                if (refreshing) {
+                    return;
+                }
+                alwaysPad = checked;
+                scheduleWrite();
+            }
+        });
+        h.addView(alwaysPadSwitch);
+
+        TextView alwaysPadDesc = new TextView(this);
+        alwaysPadDesc.setTextSize(13);
+        alwaysPadDesc.setTextColor(cSecondary);
+        alwaysPadDesc.setPadding(dp(8), dp(2), 0, 0);
+        alwaysPadDesc.setText("边距优化开启时无需此项（补页已自动生效）。开启后："
+                + "关闭边距优化时仍把页数补成双数并保护这页空白；横屏三页模式"
+                + "始终不补（三页为一组，补双数与翻页分组无关）。");
+        h.addView(alwaysPadDesc);
+
         lockSwitch = new Switch(this);
         lockSwitch.setText("锁屏允许横屏");
         lockSwitch.setTextSize(15);
@@ -373,6 +403,7 @@ public class MainActivity extends Activity {
                 // the exclusion key is owned by AppPickerActivity, never here
                 boolean ok = SettingsWriter.put(MainActivity.this, KEY_COLUMNS, cols)
                         & SettingsWriter.put(MainActivity.this, KEY_PAD_OPT, padOpt ? 1 : 0)
+                        & SettingsWriter.put(MainActivity.this, KEY_ALWAYS_PAD, alwaysPad ? 1 : 0)
                         & SettingsWriter.put(MainActivity.this, KEY_PAD_PORT, 120)
                         & SettingsWriter.put(MainActivity.this, KEY_PAD_LAND, padLand)
                         & SettingsWriter.put(MainActivity.this, KEY_LAND_PAGES, landPages)
@@ -445,7 +476,7 @@ public class MainActivity extends Activity {
     private String doExport(Uri uri) {
         try {
             Map<String, String> values = new LinkedHashMap<String, String>();
-            for (String key : PrefsKeys.LEGACY_KEYS) {
+            for (String key : PrefsKeys.CONFIG_KEYS) {
                 if (PrefsKeys.KEY_ROT_EXCLUDE.equals(key)) {
                     values.put(key, MixPrefs.getString(this, key,
                             PrefsKeys.DEF_ROT_EXCLUDE));
@@ -576,6 +607,7 @@ public class MainActivity extends Activity {
         cols = read(KEY_COLUMNS, 3);
         landPages = read(KEY_LAND_PAGES, 3);
         padOpt = read(KEY_PAD_OPT, 0) == 1;
+        alwaysPad = read(KEY_ALWAYS_PAD, 0) == 1;
         lockRot = read(KEY_LOCK_ROT, 1) == 1;
         freeRot = read(KEY_FREE_ROT, 1) == 1;
         refreshing = true;
@@ -594,6 +626,9 @@ public class MainActivity extends Activity {
             }
             if (optSwitch != null) {
                 optSwitch.setChecked(padOpt);
+            }
+            if (alwaysPadSwitch != null) {
+                alwaysPadSwitch.setChecked(alwaysPad);
             }
             if (lockSwitch != null) {
                 lockSwitch.setChecked(lockRot);

@@ -58,6 +58,7 @@ mkdir -p "$OUT_DIR/shim" "$OUT_DIR/main" "$OUT_DIR/t"
     app/src/cetushome/hook/BackupCodec.java \
     app/src/cetushome/hook/ExcludeCodec.java \
     app/src/cetushome/hook/OrientationPolicy.java \
+    app/src/cetushome/hook/PageParity.java \
     app/src/cetushome/hook/PrefsKeys.java \
     app/src/cetushome/hook/PrefsMigration.java \
     app/src/cetushome/hook/WidgetSpan.java

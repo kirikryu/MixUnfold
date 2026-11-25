@@ -69,6 +69,22 @@ public final class PrefsMigrationTest {
                 new TreeSet<String>(Arrays.asList(PrefsKeys.LEGACY_KEYS)).size());
         check("migration marker is not a legacy key",
                 false, PrefsKeys.isLegacyKey(PrefsKeys.KEY_MIGRATED));
+        // post-1.9.0 keys have no Settings.System ancestor: migrating them
+        // would read a namespace that never held them
+        check("pairs opt-in is not a legacy key",
+                false, PrefsKeys.isLegacyKey(PrefsKeys.KEY_ALWAYS_PAD));
+        check("pairs opt-in is a config (backup) key",
+                true, PrefsKeys.isConfigKey(PrefsKeys.KEY_ALWAYS_PAD));
+        check("legacy keys are config keys too",
+                true, PrefsKeys.isConfigKey(PrefsKeys.KEY_PAD_OPT));
+        check("migration marker is not a config key",
+                false, PrefsKeys.isConfigKey(PrefsKeys.KEY_MIGRATED));
+        check("pairs opt-in default",
+                0, PrefsKeys.defaultInt(PrefsKeys.KEY_ALWAYS_PAD));
+        check("pairs opt-in accepts 0",
+                true, PrefsKeys.validInt(PrefsKeys.KEY_ALWAYS_PAD, 0));
+        check("pairs opt-in rejects 2",
+                false, PrefsKeys.validInt(PrefsKeys.KEY_ALWAYS_PAD, 2));
 
         // --- defaults match the 1.8.4 read-time defaults -----------------
         check("columns default", 3, PrefsKeys.defaultInt(PrefsKeys.KEY_COLUMNS));
