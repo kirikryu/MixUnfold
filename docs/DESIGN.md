@@ -75,9 +75,11 @@
 （`cetushome.rotationunlock.RESTART`），保留作手动/调试重启入口；控制
 面板的「重启系统桌面」走固定命令的 su 路径（见第 15 节），不发送该广播。
 
-第三目标进程 `system_server`：**引擎模式（E0+E1，见第 11 节）**——点亮休眠的
-MIUI 折叠横屏引擎并桥接排除清单（E0）与平行窗口旋转（E1）；第 10 节的
-W1–W5 为引擎不可用时的回退实现（当前 ROM 已验证引擎可用，未注册）。
+第三目标进程 `system_server`：**引擎模式（E0+E1+E2/E3+E4，见第 11 节）**
+——点亮休眠的 MIUI 折叠横屏引擎并桥接排除清单（E0）与平行窗口旋转
+（E1），读点竖屏钉掩码（E2/E3），以及状态栏外观取样备忘（E4，旋转卡顿
+根因见第 11 节末）；第 10 节的 W1–W5 为引擎不可用时的回退实现（当前 ROM
+已验证引擎可用，未注册）。
 
 另一目标进程 `com.android.systemui`（锁屏旋转解锁，根因与风险见第 9 节）：
 
@@ -444,6 +446,49 @@ PACKAGE_REPLACED 刷新路径）后重启；"系统框架"作用域在 LSPosed �
       （站立钉立刻重新生效），E1b 还原路径缺失不再有行为影响；非竖屏钉
       结果在热路径只付一次 int 比较。
   - 同仅引擎模式注册（legacy W2/W3 未挂，读点不双注册）。
+- **E4（状态栏外观取样备忘，1.9.5）——旋转卡顿的真正堵点**。症状
+  （机主实测 + 复现）：嵌入双栏应用竖→横要 4–11 秒窗口才铺满，横→竖
+  只要 0.2–0.5 秒。2026-11-25 真机 Perfetto（cetus，IT之家双栏，两轮
+  往返）定位到与方向无关的**原厂缺陷**：
+  - `WindowManagerServiceImpl.createAppearance(Rect)`（miui-services.jar）
+    裁剪缓存的模糊壁纸位图并逐像素求平均色（`getPixel` + 4 次
+    `Color.*`），用于决定状态栏图标明暗；由
+    `MiuiEmbeddingWindowService.addStatusBarAppearanceRegionsForLetterBox`
+    （:1633，门控 `isFullyTransparentBarAllowed` = AE ∥ FO）从
+    `DisplayPolicy.applyPostLayoutPolicyLw`（:1652）逐窗调用，**整段在
+    窗口管理器全局锁内**，且随每次 relayout 重跑（trace：`relayoutWindow
+    → performSurfacePlacement → applySurfaceChanges → applyPostLayoutPolicy`）。
+  - **为什么每次都重算**：调用方每侧只有一个缓存槽，且命中条件要求上次
+    结果 ≠ -1，**负结果永不缓存**；两个窗格请求的矩形不同（窗格矩形与
+    任务宽矩形），互相把槽位顶掉，于是每轮布局两个矩形都重新采样。
+  - 实测代价：`applyPostLayoutPolicy` 呈**双峰**——400 次 <1 ms，91 次
+    >50 ms（均值 158 ms），合计 14.4 s / 30 s trace，其中 **99.9% 是
+    纯 CPU**（非等锁、非 Binder）；重活分散在 23 个 binder 线程上，即
+    **每个 relayout 调用方都持锁付一次**，窗口锁饱和度约 90%，应用自己的
+    配置回调（IT之家主线程 `activityConfigChanged` 累计 9.0 s、
+    `relayoutWindow` 平均 106 ms/次）只能排队。
+  - **为什么只有竖→横重**：竖→横要新建/重排两个宽窗格，relayout 次数
+    成倍；横→竖时旧窗格本就溢出满屏，重排路径不触发（跨应用一致）。
+    直播吧配置成"仅横屏分栏"后 0.19 s，是因为该路径不下发窗格 resize
+    （`MiuiSplitController` 固定横屏分支直接 return、零 WCT），不是同一个
+    循环跑得更快。
+  - **E4 实现**：hook 该方法加一层有界备忘（`AppearanceMemo`，纯逻辑，
+    JVM 回归 `AppearanceMemoTest`），键 =（位图弱引用, 矩形），命中直接
+    返回上次的 int、连位图裁剪分配都省掉。`createAppearance` 是
+    （位图像素, 矩形）的纯函数，**输出逐位一致**（含 -1），位图换引用
+    （换壁纸）自然失效；不写任何原厂状态，无开关、无还原路径。
+  - **实测效果**（同一协议、同一双栏任务）：竖→横 **0.26 / 0.35 s**
+    （修复前 4.32 / 9.39 / 10.78 / 3.92 s），横→竖 0.26 / 0.28 s 不变，
+    `PerfMonitor longMsg` 从每轮 3–12 条降到 **0**；状态栏图标明暗与双栏
+    占位页视觉检查无变化。
+  - **排查记录（避免重走弯路）**：① `set-transparentBarAE 0` 无效——门是
+    AE ∥ FO 或门，FO 路对任何非嵌入包默认放行（`isTransparentBar` 无规则
+    返回 true，规则默认值 "true"），要关得两条一起关，且它会改变状态栏
+    透明外观，只能做 A/B 不能当修复；② `splitMinWidth=800` 只挡住"竖屏
+    分栏形成"，对已形成的双栏（含自适配应用）无效——IT之家规则里本来就
+    有 `splitMinWidth=800.0` 且竖屏照样分栏，酷安的规则根本不经系统表；
+    ③ 客户端 organizer 队列、3 s 空容器超时等异步边界真实存在，但 trace
+    显示它们不是这几秒的主因（app 主线程时间几乎都在等窗口锁）。
 - **总开关语义**：关 → `isEnabled()` 恢复 false → 引擎休眠、全机原厂
   （允许表文件残留但引擎不读，无行为影响）。
 - **已知限制（排除清单变更需重启才完美应用，机主标记待修）**：引擎在

@@ -136,7 +136,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * off) — so E2/E3 re-answer any app-forced PORTRAIT-family request as
  * "follow" at the read points both display rotation and config propagation
  * consult: form-independent, stateless, exclusion restores stock
- * instantly. The legacy W1-W5 hand-written
+ * instantly. E4 memoises the ROM's status-bar appearance sampling
+ * (WindowManagerServiceImpl.createAppearance), which stock re-runs for
+ * every window on every layout pass under the window manager lock because
+ * its single-slot cache drops -1 results — measured as the multi-second
+ * pane resize on portrait -> landscape; the memo returns the identical int
+ * per (bitmap, rect) and writes no stock state. The legacy W1-W5 hand-written
  * read/write point rewrites remain
  * in the source as a fallback for ROMs without the engine impl class; on
  * those, the unfolded inner display follows auto-rotate for every
@@ -1785,6 +1790,119 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
+     * E4 — status-bar appearance memo (1.9.5). On-device Perfetto evidence
+     * (2026-11-25, cetus, IT Home dual pane): turning portrait -> landscape
+     * stalls the pane resize for 4-11 s while stock portrait -> landscape
+     * takes 0.3-0.5 s. The stall is not the app and not the embedding
+     * organizer: it is WindowManagerServiceImpl.createAppearance, called
+     * once per window per layout pass from DisplayPolicy.applyPostLayoutPolicy
+     * with the window manager global lock held. It crops the cached blur
+     * wallpaper bitmap and walks it pixel by pixel (getPixel + four
+     * Color.* calls) to pick the status-bar icon appearance. Its caller
+     * keeps a SINGLE-SLOT cache per side and refuses to cache a -1 result,
+     * so two embedding panes asking with different rects evict each other
+     * and every pass re-samples both: 91 passes >50 ms, mean 158 ms, 99.9%
+     * on-CPU, spread over 23 binder threads — every relayout caller pays it
+     * while holding the lock, so the pane's own config change queues behind
+     * a saturated lock.
+     *
+     * createAppearance is a pure function of (bitmap pixels, rect), so
+     * memoising it is byte-identical: same int out, including the -1
+     * "outside the bitmap" answer the stock cache drops. Keyed weakly by
+     * bitmap identity, so a wallpaper change invalidates everything and no
+     * stale bitmap is pinned. Nothing is written to stock state, and with
+     * the hook absent the ROM behaves exactly as before — no switch, no
+     * restore path, no behavioural change to undo.
+     *
+     * Registered in engine mode only (the mode this ROM uses; the legacy
+     * W1-W5 fallback never runs here).
+     */
+    private static final AppearanceMemo APPEARANCE_MEMO = new AppearanceMemo();
+    private static boolean memoFirstCall;
+    private static boolean memoFirstHit;
+
+    private static void hookAppearanceMemo(XC_LoadPackage.LoadPackageParam lpp) {
+        final Class<?> implCls;
+        try {
+            implCls = XposedHelpers.findClass(
+                    "com.android.server.wm.WindowManagerServiceImpl", lpp.classLoader);
+        } catch (Throwable t) {
+            log("E4 unavailable (no WindowManagerServiceImpl): " + t);
+            return;
+        }
+        try {
+            XposedHelpers.findAndHookMethod(implCls, "createAppearance",
+                    android.graphics.Rect.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                Object bmp = blurBitmap(param.thisObject);
+                                android.graphics.Rect r =
+                                        (android.graphics.Rect) param.args[0];
+                                if (bmp == null || r == null) {
+                                    return; // nothing to key on: stock path
+                                }
+                                Integer hit = APPEARANCE_MEMO.lookup(
+                                        bmp, r.left, r.top, r.right, r.bottom);
+                                if (hit == null) {
+                                    return;
+                                }
+                                param.setResult(hit);
+                                if (!memoFirstHit) {
+                                    memoFirstHit = true;
+                                    log("E4 hit: createAppearance(" + r + ") -> " + hit
+                                            + " reused (sampling skipped)");
+                                }
+                            } catch (Throwable t) {
+                                // any failure keeps the stock sample
+                            }
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.getThrowable() != null) {
+                                    return; // stock threw: nothing to memoise
+                                }
+                                Object res = param.getResult();
+                                if (!(res instanceof Integer)) {
+                                    return;
+                                }
+                                Object bmp = blurBitmap(param.thisObject);
+                                android.graphics.Rect r =
+                                        (android.graphics.Rect) param.args[0];
+                                if (bmp == null || r == null) {
+                                    return;
+                                }
+                                APPEARANCE_MEMO.remember(bmp, r.left, r.top,
+                                        r.right, r.bottom, ((Integer) res).intValue());
+                                if (!memoFirstCall) {
+                                    memoFirstCall = true;
+                                    log("E4 armed: createAppearance(" + r + ") sampled once,"
+                                            + " repeats reuse it");
+                                }
+                            } catch (Throwable t) {
+                                // keep the stock result
+                            }
+                        }
+                    });
+            log("hook E4 ok: status-bar appearance memo");
+        } catch (Throwable t) {
+            log("hook E4 FAILED: " + t);
+        }
+    }
+
+    /** The bitmap createAppearance reads, or null. Field read only: this
+     *  runs on every layout pass, so no method resolution. */
+    private static Object blurBitmap(Object impl) {
+        try {
+            return XposedHelpers.getObjectField(impl, "mBlurWallpaperBmp");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
      * W1/W2(/W3) — make every registered app follow rotation on the unfolded
      * inner display. Gate order below is part of the spec (cheapest first):
      *  a) requested/current ∉ {UNSPECIFIED(-1), UNSET(-2), BEHIND(3)} — the
@@ -1811,6 +1929,7 @@ public class MainHook implements IXposedHookLoadPackage {
         if (hookEngineMode(lpp)) {
             hookEmbeddingRotation(lpp);
             hookReadPointMask(lpp);
+            hookAppearanceMemo(lpp);
             log("system_server: ENGINE MODE active (W1-W5 superseded, not registered)");
             return;
         }
